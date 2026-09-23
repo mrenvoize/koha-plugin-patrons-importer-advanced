@@ -251,7 +251,7 @@ sub cronjob_nightly {
                 $debug && say "Loading local file from $directory/$filename";
             }
             elsif ( $job->{sftp} ) {
-                $directory = tempdir();
+                $directory = tempdir( CLEANUP => 1 );
                 $filename  = process_tt( $job->{sftp}->{filename} // q{} );
 
                 my $sftp_dir = defined $job->{sftp}->{directory} ? process_tt( $job->{sftp}->{directory} ) : undef;
