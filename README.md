@@ -14,6 +14,7 @@ It can support unlimited files with different configurations and allows for rena
   post_import_transformer: my_post_import_transformer # called after the import for a given job is completed
   sftp:
     host: sftp.library.org
+    port: 22 # Optional, defaults to 22
     username: admin
     password: secret
     directory: /my/dir # Can be template toolkit markup, e.g. `"[% USE date %]CCC_STUDENTS_[% date.format(date.now, '%Y%m%d') %].csv"`
@@ -133,6 +134,7 @@ The transformers are stored within the `config` block of the Koha configuration 
   post_import_transformer: my_post_import_transformer
   sftp:
     host: sftp.library.org
+    port: 22
     username: admin
     password: secret
     directory: /my/dir 
