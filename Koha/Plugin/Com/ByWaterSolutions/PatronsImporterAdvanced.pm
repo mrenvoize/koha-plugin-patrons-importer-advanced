@@ -147,7 +147,7 @@ sub get_sftp {
     my $sftp_host     = $job->{sftp}->{host};
     my $sftp_username = $job->{sftp}->{username};
     my $sftp_password = $job->{sftp}->{password};
-    my $sftp_dir      = $job->{sftp}->{directory};
+    my $sftp_dir      = defined $job->{sftp}->{directory} ? process_tt( $job->{sftp}->{directory} ) : undef;
     my $sftp_port     = $job->{sftp}->{port};
 
     my $sftp = Net::SFTP::Foreign->new(
@@ -252,9 +252,9 @@ sub cronjob_nightly {
             }
             elsif ( $job->{sftp} ) {
                 $directory = tempdir();
-                $filename  = $job->{sftp}->{filename};
+                $filename  = process_tt( $job->{sftp}->{filename} // q{} );
 
-                my $sftp_dir = $job->{sftp}->{directory};
+                my $sftp_dir = defined $job->{sftp}->{directory} ? process_tt( $job->{sftp}->{directory} ) : undef;
 
                 my $sftp = $self->get_sftp($job);
 
