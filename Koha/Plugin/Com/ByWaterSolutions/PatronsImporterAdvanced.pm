@@ -11,6 +11,7 @@ use C4::Log qw(logaction);
 use Koha::Config;
 use Koha::Email;
 use Koha::Encryption;
+use Koha::File::Transports;
 use Koha::Patrons::Import;
 use Koha::TemplateUtils qw(process_tt);
 
@@ -88,16 +89,28 @@ sub configure {
 
             my @results;
             foreach my $job (@$data) {
-                if ( $job->{sftp} ) {
-                    my $error;
-                    try {
+                next unless $job->{sftp} || $job->{file_transport};
+
+                my $label =
+                  $job->{file_transport}
+                  ? "file transport for job '" . ( $job->{name} // q{} ) . "'"
+                  : $job->{sftp}->{host};
+
+                my $error;
+                try {
+                    if ( $job->{file_transport} ) {
+                        my $transport = $self->get_file_transport($job);
+                        $label = "file transport '" . $transport->name . "' ( " . $transport->host . " )";
+                        $transport->disconnect;
+                    }
+                    else {
                         my $sftp = $self->get_sftp($job);
                     }
-                    catch {
-                        $error = $_;
-                    };
-                    push( @results, { job => $job, error => $error } );
                 }
+                catch {
+                    $error = $_;
+                };
+                push( @results, { job => $job, label => $label, error => $error } );
             }
 
             $template->param( results => \@results, test_completed => 1 );
@@ -168,6 +181,85 @@ sub get_sftp {
       . Data::Dumper::Dumper( $job->{sftp} );
 
     return $sftp;
+}
+
+=head3 get_file_transport
+
+Returns the Koha::File::Transport referenced by a job's 'file_transport' block,
+connected and positioned in the job's directory. Dies if the transport can't be
+found or connected to, or if the directory can't be changed to.
+
+=cut
+
+sub get_file_transport {
+    my ( $self, $job ) = @_;
+    my $conf = $job->{file_transport};
+
+    die "Patrons Importer - FILE TRANSPORT ERROR: file_transport requires a filename"
+      unless ref $conf eq 'HASH' && defined $conf->{filename} && length $conf->{filename};
+
+    my $transport;
+    if ( $conf->{id} ) {
+        $transport = Koha::File::Transports->find( $conf->{id} );
+        die "Patrons Importer - FILE TRANSPORT ERROR: No file transport found with id $conf->{id}"
+          unless $transport;
+    }
+    elsif ( $conf->{name} ) {
+        my $transports = Koha::File::Transports->search( { name => $conf->{name} } );
+        my $count      = $transports->count;
+        die "Patrons Importer - FILE TRANSPORT ERROR: No file transport found named '$conf->{name}'"
+          unless $count;
+        die "Patrons Importer - FILE TRANSPORT ERROR: $count file transports are named '$conf->{name}', use id instead"
+          if $count > 1;
+        $transport = $transports->next;
+    }
+    else {
+        die "Patrons Importer - FILE TRANSPORT ERROR: file_transport requires an id or a name";
+    }
+
+    _file_transport_op( $transport, 'connect', sub { $transport->connect } );
+
+    # The job's directory overrides the transport's download directory
+    my $directory =
+      ( defined $conf->{directory} && length $conf->{directory} )
+      ? process_tt( $conf->{directory} )
+      : $transport->download_directory;
+
+    if ($directory) {
+        _file_transport_op( $transport, "change directory to '$directory'",
+            sub { $transport->change_directory($directory) } );
+    }
+
+    return $transport;
+}
+
+# Koha 25.11's SFTP transport dies ( missing JSON import ) instead of returning false when
+# an operation fails, but it records the real error on the object first. So run every
+# transport operation in a try block and build the message from the object's error messages.
+sub _file_transport_op {
+    my ( $transport, $description, $code ) = @_;
+
+    my $exception;
+    my $ok = try { $code->() } catch { $exception = $_; 0 };
+    return 1 if $ok;
+
+    my $label = sprintf( "'%s' ( #%s, %s://%s )",
+        $transport->name, $transport->id, $transport->transport, $transport->host );
+    my $reason = _file_transport_errors($transport);
+    $reason .= " ( exception: $exception )" if $exception;
+
+    die "Patrons Importer - FILE TRANSPORT ERROR: $description failed for file transport $label: $reason";
+}
+
+sub _file_transport_errors {
+    my ($transport) = @_;
+
+    my @errors = map {
+        my $payload = $_->payload || {};
+        $_->message . ': ' . ( $payload->{error} // 'unknown error' );
+    } grep { $_->type eq 'error' } @{ $transport->object_messages };
+
+    return join( '; ', @errors ) || 'unknown error';
 }
 
 =head3 get_configuration
@@ -249,6 +341,22 @@ sub cronjob_nightly {
                 $directory = $job->{local}->{directory};
                 $filename  = $job->{local}->{filename};
                 $debug && say "Loading local file from $directory/$filename";
+            }
+            elsif ( $job->{file_transport} ) {
+                $directory = tempdir( CLEANUP => 1 );
+
+                my $transport = $self->get_file_transport($job);
+                $filename = process_tt( $job->{file_transport}->{filename} );
+
+                $debug
+                  && say qq{Downloading '$filename' via file transport '}
+                  . $transport->name
+                  . qq{' to '$directory/$filename'};
+
+                _file_transport_op( $transport, "download of '$filename'",
+                    sub { $transport->download_file( $filename, "$directory/$filename" ) } );
+
+                $transport->disconnect;
             }
             elsif ( $job->{sftp} ) {
                 $directory = tempdir( CLEANUP => 1 );

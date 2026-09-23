@@ -20,10 +20,10 @@
             [% FOREACH r IN results %]
                 [% IF r.error %]
                     <div class="alert alert-error" role="alert">
-                        Test completed with errors for [% r.job.sftp.host | html %]: <pre>[% r.error %]</pre>
+                        Test completed with errors for [% r.label | html %]: <pre>[% r.error | html %]</pre>
                     </div>
                 [% ELSE %]
-                    <div class="alert alert-success" role="alert">Test completed successfully for [% r.job.sftp.host | html %]!</div>
+                    <div class="alert alert-success" role="alert">Test completed successfully for [% r.label | html %]!</div>
                 [% END %]
             [% END %]
         [% ELSIF test_completed %]
@@ -35,9 +35,9 @@
               <input type="hidden" name="method" value="[% METHOD %]"/>
               <input type="hidden" name="test" value="1" />
               <div class="form-group">
-                  <label for="run-test-connection">Test SFTP connection</label>
+                  <label for="run-test-connection">Test connections</label>
                   <button type="submit" id="run-test-connection" class="btn btn-default">Test</button>
-                  <span id="helpBlock" class="help-block">Test the SFTP connection using the data provided below.</span>
+                  <span id="helpBlock" class="help-block">Test the SFTP and file transport connections using the data provided below.</span>
               </div>
             </form>
         [% END %]

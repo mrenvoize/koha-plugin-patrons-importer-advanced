@@ -12,14 +12,19 @@ It can support unlimited files with different configurations and allows for rena
   debug: 0      # Enable debugging for development
   verbose: 3    # Gives more verbose output from the Koha patron import process
   post_import_transformer: my_post_import_transformer # called after the import for a given job is completed
-  sftp:
+  file_transport: # Use a file transport defined in Koha under Administration > File transports ( Koha 25.11 or later )
+    id: 1                  # The file transport id, visible in the URL when editing the transport
+    name: My SFTP server   # Alternative to id, must match exactly one file transport
+    directory: /my/dir     # Optional, overrides the transport's download directory. Can be template toolkit markup
+    filename: myfile.txt   # Can be template toolkit markup
+  sftp:         # Connection settings stored in this configuration, ignored if file_transport or local is set
     host: sftp.library.org
     port: 22 # Optional, defaults to 22
     username: admin
     password: secret
     directory: /my/dir # Can be template toolkit markup, e.g. `"[% USE date %]CCC_STUDENTS_[% date.format(date.now, '%Y%m%d') %].csv"`
     filename: myfile.txt # Can be template toolkit markup
-  local:        # If a local file is set, sftp settings will be ignored
+  local:        # If a local file is set, file_transport and sftp settings will be ignored
     directory: /kohadevbox/koha # Can be template toolkit markup
     filename: ERU_student_data.txt # Can be template toolkit markup
   file: # If the file you are ingesting has no header, you can inject one
@@ -83,6 +88,14 @@ It can support unlimited files with different configurations and allows for rena
     reply_to: them@example.com
 ```
 
+## File transports
+
+On Koha 25.11 or later the connection can be a Koha file transport ( Administration > File transports ) instead of an `sftp` block. File transports support SFTP with a password or a key file, and FTP, and keep the credentials out of the plugin configuration. Reference the transport by its `id` or its `name`, and set the `filename` to download. The transport's download directory is used unless the job sets its own `directory`.
+
+Caveats:
+* Key file authentication requires Koha 26.05 or later.
+* On Koha 25.11, a `local` transport ignores the job's `directory` when the transport has its own download directory.
+
 The transformers are stored within the `config` block of the Koha configuration file:
 ```xml
  <patrons_importer_advanced>
@@ -132,6 +145,11 @@ The transformers are stored within the `config` block of the Koha configuration 
   debug: 0
   verbose: 3
   post_import_transformer: my_post_import_transformer
+  file_transport:
+    id: 1
+    name: My SFTP server
+    directory: /my/dir
+    filename: myfile.txt
   sftp:
     host: sftp.library.org
     port: 22
