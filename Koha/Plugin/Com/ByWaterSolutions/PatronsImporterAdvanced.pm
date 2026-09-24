@@ -154,11 +154,14 @@ sub _redacted_yaml {
 
 =head3 _migrate_job_transport
 
-Given a single job hashref, if it has a legacy C<sftp> or C<local> block and
-no C<file_transport_id> yet, create an equivalent C<Koha::File::Transport>
-row, point the job at it via C<file_transport_id>, and remove the legacy
-block. Idempotent: a job that already has C<file_transport_id>, or has
-neither block, is returned unchanged.
+Given a single job hashref, if it has a legacy C<sftp>, C<local>, or
+C<file_transport> block and no C<file_transport_id> yet, point the job at
+the equivalent C<file_transport_id> and remove the legacy block. C<sftp>/
+C<local> blocks get a brand new C<Koha::File::Transport> row created for
+them; a C<file_transport> block already references an existing one (by id
+or by name), so it's simply resolved and pointed to directly. Idempotent: a
+job that already has C<file_transport_id>, or has none of the three legacy
+blocks, is returned unchanged.
 
 =cut
 
@@ -167,7 +170,37 @@ sub _migrate_job_transport {
 
     return $job if $job->{file_transport_id};
 
-    if ( my $sftp = $job->{sftp} ) {
+    if ( my $ft = $job->{file_transport} ) {
+        my $transport;
+        if ( $ft->{id} ) {
+            $transport = Koha::File::Transports->find( $ft->{id} );
+            die "Patrons Importer - MIGRATION ERROR: No file transport found with id $ft->{id}"
+              unless $transport;
+        }
+        elsif ( $ft->{name} ) {
+            my $transports = Koha::File::Transports->search( { name => $ft->{name} } );
+            my $count       = $transports->count;
+            die "Patrons Importer - MIGRATION ERROR: No file transport found named '$ft->{name}'"
+              unless $count;
+            die "Patrons Importer - MIGRATION ERROR: $count file transports are named '$ft->{name}', use id instead"
+              if $count > 1;
+            $transport = $transports->next;
+        }
+        else {
+            die "Patrons Importer - MIGRATION ERROR: file_transport requires an id or a name";
+        }
+
+        $job->{file_transport_id} = $transport->file_transport_id;
+        $job->{filename}          = $ft->{filename};
+
+        # The transport's own download_directory is never TT-rendered, but a
+        # job's `path` override always is - so any directory override here,
+        # markup or not, is safe to carry over as `path` unconditionally.
+        $job->{path} = $ft->{directory} if defined $ft->{directory} && length $ft->{directory};
+
+        delete $job->{file_transport};
+    }
+    elsif ( my $sftp = $job->{sftp} ) {
         my $transport = Koha::File::Transport->new(
             {
                 name               => "PatronsImporterAdvanced: " . ( $job->{name} // 'unnamed job' ),
@@ -226,89 +259,15 @@ sub _test_job_transport {
     my $transport = Koha::File::Transports->find( $job->{file_transport_id} );
     return { ok => 0, error => "No such file_transport_id: $job->{file_transport_id}" } unless $transport;
 
-    return { ok => 1 } if $transport->test_connection;
+    # Some Koha versions' SFTP transport dies rather than returning false on
+    # failure (e.g. Koha 25.11, missing JSON import) - catch that too, not
+    # just a false return, so a bad connection is reported per-job instead
+    # of crashing the whole "Test connections" button.
+    my $ok = try { $transport->test_connection } catch { 0 };
+    return { ok => 1 } if $ok;
 
     my $error = join( '; ', map { $_->message } @{ $transport->object_messages } );
     return { ok => 0, error => $error || 'Unknown error' };
-}
-
-=head3 get_file_transport
-
-Returns the Koha::File::Transport referenced by a job's 'file_transport' block,
-connected and positioned in the job's directory. Dies if the transport can't be
-found or connected to, or if the directory can't be changed to.
-
-=cut
-
-sub get_file_transport {
-    my ( $self, $job ) = @_;
-    my $conf = $job->{file_transport};
-
-    die "Patrons Importer - FILE TRANSPORT ERROR: file_transport requires a filename"
-      unless ref $conf eq 'HASH' && defined $conf->{filename} && length $conf->{filename};
-
-    my $transport;
-    if ( $conf->{id} ) {
-        $transport = Koha::File::Transports->find( $conf->{id} );
-        die "Patrons Importer - FILE TRANSPORT ERROR: No file transport found with id $conf->{id}"
-          unless $transport;
-    }
-    elsif ( $conf->{name} ) {
-        my $transports = Koha::File::Transports->search( { name => $conf->{name} } );
-        my $count      = $transports->count;
-        die "Patrons Importer - FILE TRANSPORT ERROR: No file transport found named '$conf->{name}'"
-          unless $count;
-        die "Patrons Importer - FILE TRANSPORT ERROR: $count file transports are named '$conf->{name}', use id instead"
-          if $count > 1;
-        $transport = $transports->next;
-    }
-    else {
-        die "Patrons Importer - FILE TRANSPORT ERROR: file_transport requires an id or a name";
-    }
-
-    _file_transport_op( $transport, 'connect', sub { $transport->connect } );
-
-    # The job's directory overrides the transport's download directory
-    my $directory =
-      ( defined $conf->{directory} && length $conf->{directory} )
-      ? process_tt( $conf->{directory} )
-      : $transport->download_directory;
-
-    if ($directory) {
-        _file_transport_op( $transport, "change directory to '$directory'",
-            sub { $transport->change_directory($directory) } );
-    }
-
-    return $transport;
-}
-
-# Koha 25.11's SFTP transport dies ( missing JSON import ) instead of returning false when
-# an operation fails, but it records the real error on the object first. So run every
-# transport operation in a try block and build the message from the object's error messages.
-sub _file_transport_op {
-    my ( $transport, $description, $code ) = @_;
-
-    my $exception;
-    my $ok = try { $code->() } catch { $exception = $_; 0 };
-    return 1 if $ok;
-
-    my $label = sprintf( "'%s' ( #%s, %s://%s )",
-        $transport->name, $transport->id, $transport->transport, $transport->host );
-    my $reason = _file_transport_errors($transport);
-    $reason .= " ( exception: $exception )" if $exception;
-
-    die "Patrons Importer - FILE TRANSPORT ERROR: $description failed for file transport $label: $reason";
-}
-
-sub _file_transport_errors {
-    my ($transport) = @_;
-
-    my @errors = map {
-        my $payload = $_->payload || {};
-        $_->message . ': ' . ( $payload->{error} // 'unknown error' );
-    } grep { $_->type eq 'error' } @{ $transport->object_messages };
-
-    return join( '; ', @errors ) || 'unknown error';
 }
 
 =head3 get_configuration
@@ -417,7 +376,12 @@ sub cronjob_nightly {
 
             $debug && say "Downloading '$filename' via transport #$transport_id to '$local_path'";
 
-            $transport->download_file( $filename, $local_path, $download_opts )
+            # Some Koha versions' SFTP transport dies rather than returning
+            # false on failure (e.g. Koha 25.11, missing JSON import) -
+            # catch that too, not just a false return, so either failure
+            # mode produces the same informative error below.
+            my $downloaded = try { $transport->download_file( $filename, $local_path, $download_opts ) } catch { 0 };
+            $downloaded
               or die "Patrons Importer - TRANSPORT ERROR: download failed for $filename: "
               . join( '; ', map { $_->message } @{ $transport->object_messages } );
 
@@ -723,7 +687,7 @@ sub upgrade {
         sub {
             foreach my $job (@$jobs) {
                 next unless ref $job eq 'HASH';
-                next unless $job->{sftp} || $job->{local};
+                next unless $job->{sftp} || $job->{local} || $job->{file_transport};
                 $self->_migrate_job_transport($job);
                 $changed = 1;
             }

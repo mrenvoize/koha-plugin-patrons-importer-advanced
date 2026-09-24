@@ -2,12 +2,13 @@
 
 use Modern::Perl;
 
-use Test::More tests => 5;
+use Test::More tests => 6;
 
 use YAML::XS qw(Dump);
 
 use Koha::Database;
 use Koha::Encryption;
+use Koha::File::Transport;
 use Koha::File::Transports;
 
 use Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced;
@@ -215,6 +216,67 @@ subtest 'local directory with TT markup migrates to the job path, plain director
     is(
         $plain_transport->download_directory, '/kohadevbox/koha/',
         'plain directory still stored on the transport row as before (store adds a trailing slash)'
+    );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest 'file_transport block is migrated onto file_transport_id directly' => sub {
+    plan tests => 9;
+
+    $schema->storage->txn_begin;
+
+    # Pre-create a transport for the jobs to reference, as if it had been
+    # created via Koha's Administration > File transports UI.
+    my $existing_transport = Koha::File::Transport->new(
+        {
+            transport          => 'local',
+            name                => 'Existing shared transport',
+            download_directory  => '/kohadevbox/koha',
+        }
+    )->store;
+
+    my $plugin = Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced->new( { enable_plugins => 1 } );
+    _store_configuration(
+        $plugin,
+        [
+            {
+                name           => 'By id job',
+                file_transport => { id => $existing_transport->file_transport_id, filename => 'by_id.csv' },
+                parameters     => { matchpoint => 'cardnumber' },
+            },
+            {
+                name       => 'By name job',
+                file_transport =>
+                    { name => 'Existing shared transport', filename => 'by_name.csv', directory => '/override/dir' },
+                parameters => { matchpoint => 'cardnumber' },
+            },
+        ]
+    );
+
+    $plugin->upgrade();
+
+    my $jobs = $plugin->get_configuration();
+
+    is(
+        $jobs->[0]->{file_transport_id}, $existing_transport->file_transport_id,
+        'by-id job references the existing transport directly, no new row created'
+    );
+    is( $jobs->[0]->{filename}, 'by_id.csv', 'filename carried over to job root for by-id job' );
+    ok( !exists $jobs->[0]->{file_transport}, 'legacy file_transport block removed for by-id job' );
+    ok( !exists $jobs->[0]->{path}, 'by-id job gets no path key, no directory override was given' );
+
+    is(
+        $jobs->[1]->{file_transport_id}, $existing_transport->file_transport_id,
+        'by-name job resolves the name to the same existing transport'
+    );
+    is( $jobs->[1]->{filename}, 'by_name.csv', 'filename carried over to job root for by-name job' );
+    is( $jobs->[1]->{path}, '/override/dir', 'directory override carried over to the job path key' );
+    ok( !exists $jobs->[1]->{file_transport}, 'legacy file_transport block removed for by-name job' );
+
+    is(
+        Koha::File::Transports->search( {} )->count,
+        1, 'no new transport rows were created, both jobs reused the existing one'
     );
 
     $schema->storage->txn_rollback;
