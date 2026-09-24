@@ -360,6 +360,8 @@ sub cronjob_nightly {
     }
 
     foreach my $job (@$data) {
+        my $lock_name;
+        my $lock_acquired = 0;
         try {
             next if $job->{disable};
 
@@ -395,8 +397,21 @@ sub cronjob_nightly {
                 next;
             }
 
+            # Guard against overlapping runs of the same job: frequent
+            # scheduling means two cron ticks can otherwise both pass the
+            # content-hash check before either records its run. MySQL user
+            # lock names are limited to 64 characters, so hash longer ones.
+            $lock_name = "PatronsImporterAdvanced:" . ( $job->{name} // 'unnamed job' );
+            $lock_name = sha256_hex($lock_name) if length($lock_name) > 64;
+            ($lock_acquired) =
+              C4::Context->dbh->selectrow_array( q{SELECT GET_LOCK(?, 0)}, undef, $lock_name );
+            unless ($lock_acquired) {
+                say "JOB $job->{name} IS ALREADY RUNNING IN ANOTHER PROCESS, SKIPPING THIS RUN";
+                next;
+            }
+
             my $filename    = process_tt( $job->{filename} );
-            my $directory   = tempdir();
+            my $directory   = tempdir( CLEANUP => 1 );
             my $local_path  = "$directory/$filename";
             my $download_opts = $job->{path} ? { path => process_tt( $job->{path} ) } : {};
 
@@ -651,6 +666,12 @@ Total:       $total
         }
         catch {
             say "JOB $job->{name} FAILED WITH THE ERROR: $_";
+        }
+        finally {
+            # Always release the lock - success, failure, or skip partway
+            # through - but never release one we did not acquire.
+            C4::Context->dbh->selectrow_array( q{SELECT RELEASE_LOCK(?)}, undef, $lock_name )
+              if $lock_acquired;
         };
     }
 }
