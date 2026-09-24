@@ -133,6 +133,22 @@ The transformers are stored within the `config` block of the Koha configuration 
  </patrons_importer_advanced>
  ```
 
+## Scheduling
+
+This plugin runs whenever Koha's `misc/cronjobs/plugins_nightly.pl` cron script fires
+for it. By default sites schedule that script once nightly, but nothing about it is
+actually limited to once a day - you can add several crontab lines to check a source
+more often, e.g. every 4 hours:
+
+```
+0 6,10,14,18 * * * plugins_nightly.pl -c -m name="Advanced Patrons Importer"
+```
+
+Running more often than the source file actually changes is safe and cheap: each job
+records a content hash of its last-imported file, and a run whose downloaded file is
+byte-for-byte identical to last time is skipped rather than re-imported. `run_on_dow`
+still applies on top of this for day-of-week gating.
+
 ## Raw config ( copy and paste as a starter template )
 ```yaml
 ---
