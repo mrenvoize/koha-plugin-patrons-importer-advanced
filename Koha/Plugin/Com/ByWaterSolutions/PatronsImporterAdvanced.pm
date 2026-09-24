@@ -11,6 +11,7 @@ use C4::Log qw(logaction);
 use Koha::Config;
 use Koha::Email;
 use Koha::Encryption;
+use Koha::File::Transport;
 use Koha::File::Transports;
 use Koha::Patrons::Import;
 use Koha::TemplateUtils qw(process_tt);
@@ -18,6 +19,7 @@ use Koha::TemplateUtils qw(process_tt);
 use Data::Dumper;
 use File::Temp qw(tempdir tempfile);
 use Net::SFTP::Foreign;
+use Storable qw(dclone);
 use Text::CSV::Slurp;
 use Try::Tiny;
 use XML::Simple;
@@ -146,13 +148,64 @@ sub _redacted_yaml {
 
     return "" unless $configuration;
 
-    # The configuration is a list of jobs, each with its own sftp credentials
-    $configuration = [$configuration] unless ref $configuration eq 'ARRAY';
-    foreach my $job (@$configuration) {
+    my $redacted = dclone($configuration);
+    $redacted = [$redacted] unless ref $redacted eq 'ARRAY';
+    foreach my $job (@$redacted) {
         $job->{sftp}->{password} = "*****" if ref $job eq 'HASH' && $job->{sftp};
     }
 
-    return YAML::XS::Dump($configuration);
+    return YAML::XS::Dump($redacted);
+}
+
+=head3 _migrate_job_transport
+
+Given a single job hashref, if it has a legacy C<sftp> or C<local> block and
+no C<file_transport_id> yet, create an equivalent C<Koha::File::Transport>
+row, point the job at it via C<file_transport_id>, and remove the legacy
+block. Idempotent: a job that already has C<file_transport_id>, or has
+neither block, is returned unchanged.
+
+=cut
+
+sub _migrate_job_transport {
+    my ( $self, $job ) = @_;
+
+    return $job if $job->{file_transport_id};
+
+    if ( my $sftp = $job->{sftp} ) {
+        my $transport = Koha::File::Transport->new(
+            {
+                name               => "PatronsImporterAdvanced: " . ( $job->{name} // 'unnamed job' ),
+                transport          => 'sftp',
+                host               => $sftp->{host},
+                port               => $sftp->{port} || 22,
+                user_name          => $sftp->{username},
+                password           => $sftp->{password},
+                auth_mode          => 'password',
+                download_directory => $sftp->{directory},
+            }
+        )->store;
+
+        $job->{file_transport_id} = $transport->id;
+        $job->{filename}          = $sftp->{filename};
+        delete $job->{sftp};
+    }
+    elsif ( my $local = $job->{local} ) {
+        my $transport = Koha::File::Transport->new(
+            {
+                name               => "PatronsImporterAdvanced: " . ( $job->{name} // 'unnamed job' ),
+                transport          => 'local',
+                auth_mode          => 'noauth',
+                download_directory => $local->{directory},
+            }
+        )->store;
+
+        $job->{file_transport_id} = $transport->id;
+        $job->{filename}          = $local->{filename};
+        delete $job->{local};
+    }
+
+    return $job;
 }
 
 sub get_sftp {
@@ -638,6 +691,25 @@ plugin is installed over an existing older version of a plugin
 
 sub upgrade {
     my ( $self, $args ) = @_;
+
+    my $jobs = eval { $self->get_configuration() };
+    return 1 unless $jobs && ref $jobs eq 'ARRAY';
+
+    my $before_yaml = _redacted_yaml($jobs);
+
+    my $changed = 0;
+    foreach my $job (@$jobs) {
+        next unless ref $job eq 'HASH';
+        next unless $job->{sftp} || $job->{local};
+        $self->_migrate_job_transport($job);
+        $changed = 1;
+    }
+
+    if ($changed) {
+        my $encrypted = Koha::Encryption->new->encrypt_hex( YAML::XS::Dump($jobs) );
+        $self->store_data( { configuration => $encrypted } );
+        logaction( "PatronsImporterAdvanced", "MigrateTransports", "", _redacted_yaml($jobs), "", $before_yaml );
+    }
 
     return 1;
 }
