@@ -405,6 +405,12 @@ sub cronjob_nightly {
                 $filepath = $new_tmp_filename;
             }
 
+            my $content_hash = $self->_content_hash($filepath);
+            unless ( $self->_job_should_run( $job->{name}, $content_hash ) ) {
+                say "No changes since last run for job $job->{name}, skipping" if $debug || $verbose;
+                next;
+            }
+
             my $options = $job->{csv_options} || {};
             my $inputs = Text::CSV::Slurp->load( file => $filepath, %$options );
 
@@ -571,6 +577,11 @@ sub cronjob_nightly {
                 say "Total:       $total";
                 say q{};
             }
+
+            $self->_record_job_run(
+                $job->{name}, $content_hash,
+                { imported => $imported, overwritten => $overwritten, already_in_db => $alreadyindb, invalid => $invalid }
+            );
 
             if ( my $email_conf = $job->{email_results} ) {
 
