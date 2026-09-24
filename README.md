@@ -12,21 +12,10 @@ It can support unlimited files with different configurations and allows for rena
   debug: 0      # Enable debugging for development
   verbose: 3    # Gives more verbose output from the Koha patron import process
   post_import_transformer: my_post_import_transformer # called after the import for a given job is completed
-  file_transport: # Use a file transport defined in Koha under Administration > File transports ( Koha 25.11 or later )
-    id: 1                  # The file transport id, visible in the URL when editing the transport
-    name: My SFTP server   # Alternative to id, must match exactly one file transport
-    directory: /my/dir     # Optional, overrides the transport's download directory. Can be template toolkit markup
-    filename: myfile.txt   # Can be template toolkit markup
-  sftp:         # Connection settings stored in this configuration, ignored if file_transport or local is set
-    host: sftp.library.org
-    port: 22 # Optional, defaults to 22
-    username: admin
-    password: secret
-    directory: /my/dir # Can be template toolkit markup, e.g. `"[% USE date %]CCC_STUDENTS_[% date.format(date.now, '%Y%m%d') %].csv"`
-    filename: myfile.txt # Can be template toolkit markup
-  local:        # If a local file is set, file_transport and sftp settings will be ignored
-    directory: /kohadevbox/koha # Can be template toolkit markup
-    filename: ERU_student_data.txt # Can be template toolkit markup
+  file_transport_id: 3 # References a server configured under Koha's Administration > File transports (admin/file_transports.pl).
+                        # Works for SFTP, FTP, or a purely local directory - create the transport there first, note its ID, and reference it here.
+  filename: myfile.txt # Can be template toolkit markup, e.g. `"[% USE date %]CCC_STUDENTS_[% date.format(date.now, '%Y%m%d') %].csv"`
+  path: /my/dir         # Optional. Overrides the transport's own configured directory for this job only. Can be template toolkit markup.
   file: # If the file you are ingesting has no header, you can inject one
     header: Last Name|First Name|Middle Name|Date of Birth|Level|Email|Phone|Address 1|Address 2|City|State|Zip|Enrollment Status
   parameters:   # These values will be passed directly to Koha::Patrons::Import::import_patrons, along with the file generated
@@ -88,13 +77,21 @@ It can support unlimited files with different configurations and allows for rena
     reply_to: them@example.com
 ```
 
-## File transports
+## Upgrading from an older version
 
-On Koha 25.11 or later the connection can be a Koha file transport ( Administration > File transports ) instead of an `sftp` block. File transports support SFTP with a password or a key file, and FTP, and keep the credentials out of the plugin configuration. Reference the transport by its `id` or its `name`, and set the `filename` to download. The transport's download directory is used unless the job sets its own `directory`.
+Versions prior to this one stored SFTP/local credentials directly in each job's
+YAML (`sftp:`/`local:` blocks), or referenced a file transport via a `file_transport:
+{id: ..., name: ...}` block. On upgrade, the plugin automatically creates an
+equivalent entry under Koha's Administration > File transports for every `sftp:`/
+`local:` job (and normalizes an existing `file_transport:` block onto the same
+`file_transport_id` key), rewrites the job to reference it via `file_transport_id`,
+and removes the old block - no manual action is required. The new transport is named
+`PatronsImporterAdvanced: <job name>` so it's easy to find afterwards if you want
+to consolidate several jobs onto one shared transport.
 
-Caveats:
+Caveats carried over from the `file_transport:` block this replaces:
 * Key file authentication requires Koha 26.05 or later.
-* On Koha 25.11, a `local` transport ignores the job's `directory` when the transport has its own download directory.
+* On Koha 25.11, a `local` transport ignores a job's `path` override when the transport itself has its own download directory configured.
 
 The transformers are stored within the `config` block of the Koha configuration file:
 ```xml
