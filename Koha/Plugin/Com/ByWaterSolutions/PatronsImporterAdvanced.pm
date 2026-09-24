@@ -9,6 +9,7 @@ use base qw(Koha::Plugins::Base);
 use C4::Context;
 use C4::Log qw(logaction);
 use Koha::Config;
+use Koha::Database;
 use Koha::Email;
 use Koha::Encryption;
 use Koha::File::Transport;
@@ -94,7 +95,17 @@ sub configure {
 
             my @results;
             foreach my $job (@$data) {
-                next unless $job->{file_transport_id};
+                unless ( $job->{file_transport_id} ) {
+                    push(
+                        @results,
+                        {
+                            job   => $job,
+                            ok    => 0,
+                            error => 'Job has no file_transport_id configured - it will be skipped by the importer',
+                        }
+                    );
+                    next;
+                }
                 my $result = $self->_test_job_transport($job);
                 push( @results, { job => $job, %$result } );
             }
@@ -175,17 +186,26 @@ sub _migrate_job_transport {
         delete $job->{sftp};
     }
     elsif ( my $local = $job->{local} ) {
+
+        # Koha::File::Transport never runs Template Toolkit rendering on
+        # download_directory, but the job-level `path` override does get
+        # process_tt'd on every fetch - so a directory containing TT markup
+        # must migrate to the job's own `path` key to keep working.
+        my $directory        = $local->{directory};
+        my $directory_has_tt = defined $directory && $directory =~ /\[%/;
+
         my $transport = Koha::File::Transport->new(
             {
                 name               => "PatronsImporterAdvanced: " . ( $job->{name} // 'unnamed job' ),
                 transport          => 'local',
                 auth_mode          => 'noauth',
-                download_directory => $local->{directory},
+                download_directory => $directory_has_tt ? undef : $directory,
             }
         )->store;
 
         $job->{file_transport_id} = $transport->id;
         $job->{filename}          = $local->{filename};
+        $job->{path}              = $directory if $directory_has_tt;
         delete $job->{local};
     }
 
@@ -365,13 +385,13 @@ sub cronjob_nightly {
 
             my $transport_id = $job->{file_transport_id};
             unless ($transport_id) {
-                say "JOB $job->{name} HAS NO file_transport_id, SKIPPING" if $debug;
+                say "JOB $job->{name} HAS NO file_transport_id, SKIPPING";
                 next;
             }
 
             my $transport = Koha::File::Transports->find($transport_id);
             unless ($transport) {
-                say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING" if $debug;
+                say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING";
                 next;
             }
 
@@ -660,18 +680,34 @@ plugin is installed over an existing older version of a plugin
 sub upgrade {
     my ( $self, $args ) = @_;
 
+    my $stored = $self->retrieve_data('configuration');
+    return 1 unless $stored;
+
     my $jobs = eval { $self->get_configuration() };
+    if ($@) {
+        warn "PatronsImporterAdvanced: unable to read stored configuration during upgrade, "
+          . "skipping transport migration: $@";
+        return 1;
+    }
     return 1 unless $jobs && ref $jobs eq 'ARRAY';
 
     my $before_yaml = _redacted_yaml($jobs);
 
     my $changed = 0;
-    foreach my $job (@$jobs) {
-        next unless ref $job eq 'HASH';
-        next unless $job->{sftp} || $job->{local};
-        $self->_migrate_job_transport($job);
-        $changed = 1;
-    }
+
+    # Migrate every job's transport in a single transaction so a failure
+    # partway through leaves neither orphan transport rows nor a config
+    # that no longer matches the rows that were created.
+    Koha::Database->new->schema->storage->txn_do(
+        sub {
+            foreach my $job (@$jobs) {
+                next unless ref $job eq 'HASH';
+                next unless $job->{sftp} || $job->{local};
+                $self->_migrate_job_transport($job);
+                $changed = 1;
+            }
+        }
+    );
 
     if ($changed) {
         my $encrypted = Koha::Encryption->new->encrypt_hex( YAML::XS::Dump($jobs) );
