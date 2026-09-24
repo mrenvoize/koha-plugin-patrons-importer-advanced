@@ -158,21 +158,9 @@ still applies on top of this for day-of-week gating.
   debug: 0
   verbose: 3
   post_import_transformer: my_post_import_transformer
-  file_transport:
-    id: 1
-    name: My SFTP server
-    directory: /my/dir
-    filename: myfile.txt
-  sftp:
-    host: sftp.library.org
-    port: 22
-    username: admin
-    password: secret
-    directory: /my/dir 
-    filename: myfile.txt
-  local:
-    directory: /kohadevbox/koha
-    filename: ERU_student_data.txt
+  file_transport_id: 3
+  filename: myfile.txt
+  path: /my/dir
   file:
     header: Last Name|First Name|Middle Name|Date of Birth|Level|Email|Phone|Address 1|Address 2|City|State|Zip|Enrollment Status
   parameters:
