@@ -25,6 +25,10 @@ use XML::Simple;
 use XML::Simple qw( XMLin );
 use YAML::XS qw(Load Dump);
 
+use Digest::SHA qw(sha256_hex);
+use JSON         qw(encode_json decode_json);
+use POSIX        qw(strftime);
+
 ## Here we set our plugin version
 our $VERSION         = "{VERSION}";
 our $MINIMUM_VERSION = "{MINIMUM_VERSION}";
@@ -707,6 +711,78 @@ sub delete_if_found {
           . "$matchpoint => $output->{$matchpoint}"
           if $verbose > 1;
     }
+}
+
+=head3 _content_hash
+
+Return a SHA-256 hex digest of the given file's bytes.
+
+=cut
+
+sub _content_hash {
+    my ( $self, $filepath ) = @_;
+
+    open my $fh, '<:raw', $filepath or die "Cannot open $filepath: $!";
+    local $/;
+    my $content = <$fh>;
+    close $fh;
+
+    return sha256_hex($content);
+}
+
+=head3 _import_log
+
+Return the stored per-job run history (a hashref keyed by job name), decoding
+it from the plugin's C<import_log> data key. Defaults to an empty hashref.
+
+=cut
+
+sub _import_log {
+    my ($self) = @_;
+
+    my $stored = $self->retrieve_data('import_log');
+    return {} unless $stored;
+
+    my $data = eval { decode_json($stored) };
+    return {} if $@;
+    return $data // {};
+}
+
+=head3 _job_should_run
+
+Given a job name and the content hash of its freshly downloaded input file,
+return true if this content is new since the job's last recorded run (i.e.
+the import should proceed), false if it's identical to last time (skip).
+
+=cut
+
+sub _job_should_run {
+    my ( $self, $job_name, $content_hash ) = @_;
+
+    my $log  = $self->_import_log;
+    my $last = $log->{$job_name} or return 1;
+
+    return ( $last->{last_hash} // '' ) ne $content_hash ? 1 : 0;
+}
+
+=head3 _record_job_run
+
+Record that a job ran with the given content hash and result summary, for
+future C<_job_should_run> comparisons.
+
+=cut
+
+sub _record_job_run {
+    my ( $self, $job_name, $content_hash, $summary ) = @_;
+
+    my $log = $self->_import_log;
+    $log->{$job_name} = {
+        last_hash   => $content_hash,
+        last_run_at => strftime( '%Y-%m-%dT%H:%M:%S', localtime ),
+        %$summary,
+    };
+
+    $self->store_data( { import_log => encode_json($log) } );
 }
 
 1;
