@@ -387,49 +387,30 @@ sub cronjob_nightly {
                 }
             }
 
-            my $directory;
-            my $filename;
-
-            if ( $job->{local} ) {
-                $directory = $job->{local}->{directory};
-                $filename  = $job->{local}->{filename};
-                $debug && say "Loading local file from $directory/$filename";
-            }
-            elsif ( $job->{file_transport} ) {
-                $directory = tempdir( CLEANUP => 1 );
-
-                my $transport = $self->get_file_transport($job);
-                $filename = process_tt( $job->{file_transport}->{filename} );
-
-                $debug
-                  && say qq{Downloading '$filename' via file transport '}
-                  . $transport->name
-                  . qq{' to '$directory/$filename'};
-
-                _file_transport_op( $transport, "download of '$filename'",
-                    sub { $transport->download_file( $filename, "$directory/$filename" ) } );
-
-                $transport->disconnect;
-            }
-            elsif ( $job->{sftp} ) {
-                $directory = tempdir( CLEANUP => 1 );
-                $filename  = process_tt( $job->{sftp}->{filename} // q{} );
-
-                my $sftp_dir = defined $job->{sftp}->{directory} ? process_tt( $job->{sftp}->{directory} ) : undef;
-
-                my $sftp = $self->get_sftp($job);
-
-                $debug
-                  && say qq{Downloading '$sftp_dir/$filename' }
-                  . qq{via SFTP to '$directory/$filename'};
-
-                $sftp->get( "$sftp_dir/$filename", "$directory/$filename" )
-                  or die
-"Patrons Importer - SFTP ERROR: get failed for $sftp_dir/$filename :"
-                  . $sftp->error;
+            my $transport_id = $job->{file_transport_id};
+            unless ($transport_id) {
+                say "JOB $job->{name} HAS NO file_transport_id, SKIPPING" if $debug;
+                next;
             }
 
-            my $filepath = process_tt("$directory/$filename");
+            my $transport = Koha::File::Transports->find($transport_id);
+            unless ($transport) {
+                say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING" if $debug;
+                next;
+            }
+
+            my $filename    = process_tt( $job->{filename} );
+            my $directory   = tempdir();
+            my $local_path  = "$directory/$filename";
+            my $download_opts = $job->{path} ? { path => process_tt( $job->{path} ) } : {};
+
+            $debug && say "Downloading '$filename' via transport #$transport_id to '$local_path'";
+
+            $transport->download_file( $filename, $local_path, $download_opts )
+              or die "Patrons Importer - TRANSPORT ERROR: download failed for $filename: "
+              . join( '; ', map { $_->message } @{ $transport->object_messages } );
+
+            my $filepath = $local_path;
 
             # Write a header if needed
             if ( my $header = $job->{file}->{header} ) {
