@@ -18,12 +18,12 @@
       <div class="panel-body">
         [% IF test_completed %]
             [% FOREACH r IN results %]
-                [% IF r.error %]
-                    <div class="alert alert-error" role="alert">
-                        Test completed with errors for [% r.label | html %]: <pre>[% r.error | html %]</pre>
-                    </div>
+                [% IF r.ok %]
+                    <div class="alert alert-success" role="alert">Test completed successfully for job "[% r.job.name | html %]"!</div>
                 [% ELSE %]
-                    <div class="alert alert-success" role="alert">Test completed successfully for [% r.label | html %]!</div>
+                    <div class="alert alert-error" role="alert">
+                        Test completed with errors for job "[% r.job.name | html %]": <pre>[% r.error | html %]</pre>
+                    </div>
                 [% END %]
             [% END %]
         [% ELSIF test_completed %]

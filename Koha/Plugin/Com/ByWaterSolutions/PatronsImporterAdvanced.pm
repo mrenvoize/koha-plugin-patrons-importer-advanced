@@ -18,7 +18,6 @@ use Koha::TemplateUtils qw(process_tt);
 
 use Data::Dumper;
 use File::Temp qw(tempdir tempfile);
-use Net::SFTP::Foreign;
 use Storable qw(dclone);
 use Text::CSV::Slurp;
 use Try::Tiny;
@@ -91,28 +90,9 @@ sub configure {
 
             my @results;
             foreach my $job (@$data) {
-                next unless $job->{sftp} || $job->{file_transport};
-
-                my $label =
-                  $job->{file_transport}
-                  ? "file transport for job '" . ( $job->{name} // q{} ) . "'"
-                  : $job->{sftp}->{host};
-
-                my $error;
-                try {
-                    if ( $job->{file_transport} ) {
-                        my $transport = $self->get_file_transport($job);
-                        $label = "file transport '" . $transport->name . "' ( " . $transport->host . " )";
-                        $transport->disconnect;
-                    }
-                    else {
-                        my $sftp = $self->get_sftp($job);
-                    }
-                }
-                catch {
-                    $error = $_;
-                };
-                push( @results, { job => $job, label => $label, error => $error } );
+                next unless $job->{file_transport_id};
+                my $result = $self->_test_job_transport($job);
+                push( @results, { job => $job, %$result } );
             }
 
             $template->param( results => \@results, test_completed => 1 );
@@ -208,32 +188,24 @@ sub _migrate_job_transport {
     return $job;
 }
 
-sub get_sftp {
+=head3 _test_job_transport
+
+Test the configured file transport for a single job. Returns a hashref with
+C<ok> (boolean) and, on failure, an C<error> string built from the
+transport's recorded messages.
+
+=cut
+
+sub _test_job_transport {
     my ( $self, $job ) = @_;
-    my $sftp_host     = $job->{sftp}->{host};
-    my $sftp_username = $job->{sftp}->{username};
-    my $sftp_password = $job->{sftp}->{password};
-    my $sftp_dir      = defined $job->{sftp}->{directory} ? process_tt( $job->{sftp}->{directory} ) : undef;
-    my $sftp_port     = $job->{sftp}->{port};
 
-    my $sftp = Net::SFTP::Foreign->new(
-        host     => $sftp_host,
-        user     => $sftp_username,
-        port     => $sftp_port || 22,
-        password => $sftp_password,
-        timeout  => 5,                  # seconds
-    );
-    $sftp->die_on_error( "Patrons Importer - "
-          . "SFTP ERROR: Unable to establish SFTP connection for "
-          . Data::Dumper::Dumper( $job->{sftp} ) );
+    my $transport = Koha::File::Transports->find( $job->{file_transport_id} );
+    return { ok => 0, error => "No such file_transport_id: $job->{file_transport_id}" } unless $transport;
 
-    $sftp->setcwd($sftp_dir)
-      or die "Patrons Importer - SFTP ERROR: unable to change cwd: "
-      . $sftp->error
-      . " - for "
-      . Data::Dumper::Dumper( $job->{sftp} );
+    return { ok => 1 } if $transport->test_connection;
 
-    return $sftp;
+    my $error = join( '; ', map { $_->message } @{ $transport->object_messages } );
+    return { ok => 0, error => $error || 'Unknown error' };
 }
 
 =head3 get_file_transport
