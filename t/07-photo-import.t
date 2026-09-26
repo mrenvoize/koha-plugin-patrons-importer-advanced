@@ -2,7 +2,7 @@
 
 use Modern::Perl;
 
-use Test::More tests => 4;
+use Test::More tests => 5;
 
 use Koha::Database;
 use t::lib::TestBuilder;
@@ -10,6 +10,7 @@ use t::lib::TestBuilder;
 use GD;
 use Archive::Zip qw( :ERROR_CODES );
 use File::Temp   qw( tempfile tempdir );
+use File::Spec;
 
 use Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced;
 use Koha::Patron::Images;
@@ -184,6 +185,51 @@ subtest '_import_photo_batch: TOO_MANY_MEMBERS cap' => sub {
     my $result = $plugin->_import_photo_batch( { file => $zip_path, matchpoint => 'cardnumber' } );
     is( scalar @{ $result->{errors} }, 1,                  'a single error is returned when the cap is exceeded' );
     is( $result->{errors}[0]{error},   'TOO_MANY_MEMBERS',  'the error code is TOO_MANY_MEMBERS' );
+
+    unlink $zip_path;
+    $schema->storage->txn_rollback;
+};
+
+subtest '_import_photo_batch: symlink members are skipped, not followed' => sub {
+    plan tests => 2;
+
+    $schema->storage->txn_begin;
+
+    my $plugin = Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced->new( { enable_plugins => 1 } );
+
+    # An attacker-controlled directory elsewhere on disk, standing in for
+    # anywhere outside the batch's own extraction tempdir (e.g. /etc/cron.d
+    # in the real-world exploit). If a symlink member pointing here is
+    # followed on extraction, a later member named "evillink/evil.png"
+    # would write attacker content into this directory instead of staying
+    # contained inside the extraction tempdir.
+    my $target_dir = tempdir( CLEANUP => 1 );
+
+    my $zip = Archive::Zip->new;
+
+    # A member whose externalFileAttributes mark it as a unix symlink
+    # (0xA1FF0000, i.e. S_IFLNK|0777 << 16 - the same bit pattern
+    # Archive::Zip::Member->isSymbolicLink checks for, and that ordinary
+    # tools like `zip -y` produce), whose content is the symlink target.
+    my $link_member = Archive::Zip::Member->newFromString( $target_dir, 'evillink' );
+    $link_member->unixFileAttributes(0120777);    # S_IFLNK (0120000) | 0777
+    $zip->addMember($link_member);
+
+    # A regular member whose name would resolve through the symlink above
+    # if it were followed during extraction.
+    $zip->addString( 'attacker content', 'evillink/evil.png' );
+
+    my ( $fh, $zip_path ) = tempfile( SUFFIX => '.zip', UNLINK => 0 );
+    close $fh;
+    $zip->writeToFileNamed($zip_path) == Archive::Zip::AZ_OK or die 'Unable to write test zip';
+
+    my $result = $plugin->_import_photo_batch( { file => $zip_path, matchpoint => 'cardnumber' } );
+
+    ok( defined $result, 'batch completes without dying on a zip containing a symlink member' );
+    ok(
+        !-e File::Spec->catfile( $target_dir, 'evil.png' ),
+        'symlink member is skipped: nothing is written into the symlink target directory'
+    );
 
     unlink $zip_path;
     $schema->storage->txn_rollback;

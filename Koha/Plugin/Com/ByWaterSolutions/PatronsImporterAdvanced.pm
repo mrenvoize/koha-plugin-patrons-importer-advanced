@@ -967,8 +967,13 @@ mapping; otherwise every image file found is matched by its own filename's
 stem against C<matchpoint> directly. Each row is processed in isolation -
 one failure never aborts the rest of the batch. Rejects (without
 extracting) an archive with more than C<PHOTO_MAX_ZIP_MEMBERS>
-non-directory members. Returns C<{ imported => [...], errors => [...] }>.
-Dies with a plain string only if the zip itself cannot be read.
+non-directory members. Symbolic-link members are skipped during
+extraction - never followed, never created - since a symlink whose target
+is an out-of-tree path, combined with a later member name that resolves
+through it, would otherwise let a crafted zip write outside
+C<$extract_dir> regardless of the per-name path checks. Returns
+C<{ imported => [...], errors => [...] }>. Dies with a plain string only
+if the zip itself cannot be read.
 
 =cut
 
@@ -988,6 +993,7 @@ sub _import_photo_batch {
     my $extract_dir = tempdir( CLEANUP => 1 );
     for my $member ( $zip->members ) {
         next if $member->isDirectory;
+        next if $member->isSymbolicLink;
         my $name = $member->fileName;
         next unless $self->_is_safe_relative_path($name);
         $member->extractToFileNamed( File::Spec->catfile( $extract_dir, $name ) ) == Archive::Zip::AZ_OK
