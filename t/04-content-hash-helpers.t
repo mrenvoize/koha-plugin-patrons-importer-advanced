@@ -2,7 +2,7 @@
 
 use Modern::Perl;
 
-use Test::More tests => 4;
+use Test::More tests => 5;
 
 use File::Temp qw(tempfile);
 
@@ -68,6 +68,22 @@ subtest '_record_job_run keeps history for other jobs independent' => sub {
 
     is( $plugin->_job_should_run( 'Job A', 'hash-a' ), 0, 'Job A recognises its own unchanged hash' );
     ok( $plugin->_job_should_run( 'Job B', 'hash-a' ), 'Job B is not confused by Job A\'s hash' );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest '_job_should_run/_record_job_run key on (job, filename) when a filename is given' => sub {
+    plan tests => 4;
+
+    $schema->storage->txn_begin;
+
+    my $plugin = Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced->new( { enable_plugins => 1 } );
+    $plugin->_record_job_run( 'Photo job', 'hash-a', { imported => 1 }, 'a.png' );
+
+    is( $plugin->_job_should_run( 'Photo job', 'hash-a', 'a.png' ), 0, 'unchanged (job,filename) pair should not run' );
+    ok( $plugin->_job_should_run( 'Photo job', 'hash-b', 'a.png' ), 'changed content for the same (job,filename) should run' );
+    ok( $plugin->_job_should_run( 'Photo job', 'hash-a', 'b.png' ), 'a different filename under the same job has independent history' );
+    ok( $plugin->_job_should_run( 'Photo job', 'hash-a' ), 'the job-name-only key is unaffected by any (job,filename) history' );
 
     $schema->storage->txn_rollback;
 };

@@ -1186,33 +1186,40 @@ sub _import_log {
 
 =head3 _job_should_run
 
-Given a job name and the content hash of its freshly downloaded input file,
-return true if this content is new since the job's last recorded run (i.e.
-the import should proceed), false if it's identical to last time (skip).
+Given a job name and the content hash of its freshly downloaded input
+file, return true if this content is new since the job's last recorded
+run (i.e. the import should proceed), false if it's identical to last
+time (skip). An optional C<$filename> keys the history on the
+(job, filename) pair instead of the job name alone - used by photo jobs,
+which process many files per run and need independent history per file;
+record jobs (one file per job) omit it and keep the job-name-only key.
 
 =cut
 
 sub _job_should_run {
-    my ( $self, $job_name, $content_hash ) = @_;
+    my ( $self, $job_name, $content_hash, $filename ) = @_;
 
+    my $key  = defined $filename ? "$job_name:$filename" : $job_name;
     my $log  = $self->_import_log;
-    my $last = $log->{$job_name} or return 1;
+    my $last = $log->{$key} or return 1;
 
     return ( $last->{last_hash} // '' ) ne $content_hash ? 1 : 0;
 }
 
 =head3 _record_job_run
 
-Record that a job ran with the given content hash and result summary, for
-future C<_job_should_run> comparisons.
+Record that a job (optionally, one specific file within it - see
+C<_job_should_run>) ran with the given content hash and result summary,
+for future C<_job_should_run> comparisons.
 
 =cut
 
 sub _record_job_run {
-    my ( $self, $job_name, $content_hash, $summary ) = @_;
+    my ( $self, $job_name, $content_hash, $summary, $filename ) = @_;
 
+    my $key = defined $filename ? "$job_name:$filename" : $job_name;
     my $log = $self->_import_log;
-    $log->{$job_name} = {
+    $log->{$key} = {
         last_hash   => $content_hash,
         last_run_at => strftime( '%Y-%m-%dT%H:%M:%S', localtime ),
         %$summary,
