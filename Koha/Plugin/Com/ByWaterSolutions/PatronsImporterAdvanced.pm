@@ -22,6 +22,9 @@ use Koha::Patron::Images;
 use Koha::TemplateUtils qw(process_tt);
 
 use GD;
+use Archive::Zip qw( :ERROR_CODES );
+use Cwd          qw( realpath );
+use File::Spec;
 
 use Data::Dumper;
 use File::Temp qw(tempdir tempfile);
@@ -781,6 +784,258 @@ sub _photo_to_png {
     $resized->copyResampled( $srcimage, 0, 0, 0, 0, $new_width, $new_height, $width, $height );
 
     return $resized->png();
+}
+
+=head3 _is_safe_relative_path
+
+Structural zip-slip guard: true if C<$path> is a relative path with no
+".." component, no null byte, and is not an absolute path (unix "/..." or
+windows "C:\..."). Independent implementation of the same check used by
+C<Koha::ArticleRequest::ScanImport> and Koha core Bug 43637's
+C<Koha::Patron::Image::Import> - see the Phase 2 spec's "Forward
+compatibility" section.
+
+=cut
+
+sub _is_safe_relative_path {
+    my ( $self, $path ) = @_;
+
+    return 0 unless defined $path && length $path;
+    return 0 if $path =~ /\0/;
+    return 0 if $path =~ m{\A/};
+    return 0 if $path =~ m{\A[A-Za-z]:[\\/]};
+
+    for my $part ( split m{[\\/]+}, $path ) {
+        next unless length $part;
+        return 0 if $part eq '..';
+    }
+
+    return 1;
+}
+
+=head3 _check_photo_path_safe_and_exists
+
+Validates that C<$filename> (as resolved relative to C<$extract_dir>)
+cannot escape C<$extract_dir> - structurally via C<_is_safe_relative_path>,
+then again via C<realpath> once the file is known to exist, to also catch
+symlink-based escapes. Returns undef if safe, or an error code
+(C<UNSAFE_PATH> or C<FILE_NOT_FOUND>) otherwise.
+
+=cut
+
+sub _check_photo_path_safe_and_exists {
+    my ( $self, $extract_dir, $filename ) = @_;
+
+    return 'UNSAFE_PATH' unless $self->_is_safe_relative_path($filename);
+
+    my $candidate = File::Spec->catfile( $extract_dir, $filename );
+    return 'FILE_NOT_FOUND' unless -f $candidate;
+
+    my $real_dir  = realpath($extract_dir);
+    my $real_file = realpath($candidate);
+    return 'UNSAFE_PATH'
+      unless defined $real_file
+      && defined $real_dir
+      && ( $real_file eq $real_dir || index( $real_file, "$real_dir/" ) == 0 );
+
+    return;
+}
+
+=head3 _find_photo_image_files
+
+Recursively collects every file under C<$dir> whose name matches
+C<PHOTO_IMAGE_EXTENSION_RE>, returning each one's path relative to
+C<$base>.
+
+=cut
+
+sub _find_photo_image_files {
+    my ( $self, $dir, $base ) = @_;
+
+    opendir( my $dh, $dir ) or return;
+    my @entries = grep { !/^\.\.?$/ } readdir $dh;
+    closedir $dh;
+
+    my @found;
+    for my $entry ( sort @entries ) {
+        my $path = File::Spec->catfile( $dir, $entry );
+        if ( -d $path ) {
+            push @found, $self->_find_photo_image_files( $path, $base );
+        }
+        elsif ( $entry =~ PHOTO_IMAGE_EXTENSION_RE ) {
+            push @found, File::Spec->abs2rel( $path, $base );
+        }
+    }
+    return @found;
+}
+
+=head3 _find_photo_mapping_file
+
+Recursively searches C<$dir> for a file named C<idlink.txt> or
+C<datalink.txt> (case-insensitive), returning its full path, or undef if
+none is found.
+
+=cut
+
+sub _find_photo_mapping_file {
+    my ( $self, $dir ) = @_;
+
+    opendir( my $dh, $dir ) or return;
+    my @entries = readdir $dh;
+    closedir $dh;
+
+    for my $entry (@entries) {
+        next if $entry =~ /^\.\.?$/;
+        my $path = File::Spec->catfile( $dir, $entry );
+        return $path if -f $path && $entry =~ /^(?:idlink|datalink)\.txt$/i;
+        if ( -d $path ) {
+            my $found = $self->_find_photo_mapping_file($path);
+            return $found if $found;
+        }
+    }
+    return;
+}
+
+=head3 _photo_rows_from_mapping_file
+
+Parses C<$mapping_file> (tab- or comma-delimited "identifier,filename"
+lines, delimiter sniffed per line) into a list of C<{ identifier,
+filename }> hashrefs, or C<{ error => 'BAD_ROW' }> for a line that could
+not be parsed.
+
+=cut
+
+sub _photo_rows_from_mapping_file {
+    my ( $self, $mapping_file ) = @_;
+
+    open my $fh, '<', $mapping_file or die "Unable to read $mapping_file: $!\n";
+    my @lines = <$fh>;
+    close $fh;
+
+    my @rows;
+    for my $line (@lines) {
+        chomp $line;
+        next unless length $line;
+
+        my $delim = ( $line =~ /\t/ ) ? "\t" : ( $line =~ /,/ ) ? ',' : undef;
+        unless ($delim) {
+            push @rows, { error => 'BAD_ROW' };
+            next;
+        }
+
+        my ( $identifier, $filename ) = split $delim, $line, 2;
+        $identifier =~ s/[\"\r\n]//g if defined $identifier;
+        $filename   =~ s/[\"\r\n]//g if defined $filename;
+
+        unless ( defined $identifier && length $identifier && defined $filename && length $filename ) {
+            push @rows, { error => 'BAD_ROW' };
+            next;
+        }
+
+        push @rows, { identifier => $identifier, filename => $filename };
+    }
+    return @rows;
+}
+
+=head3 _photo_rows_from_filenames
+
+Recursively finds every image file under C<$extract_dir> and returns a
+C<{ identifier, filename }> hashref per file, where C<identifier> is the
+file's own basename with its extension removed. Used when no mapping file
+is present in the archive.
+
+=cut
+
+sub _photo_rows_from_filenames {
+    my ( $self, $extract_dir ) = @_;
+
+    my @rows;
+    for my $relative ( $self->_find_photo_image_files( $extract_dir, $extract_dir ) ) {
+        my ($basename) = $relative =~ m{([^/\\]+)$};
+        ( my $stem = $basename ) =~ s/\.[^.]+$//;
+        push @rows, { identifier => $stem, filename => $relative };
+    }
+    return @rows;
+}
+
+=head3 _import_photo_batch
+
+Extracts the zip at C<$args-E<gt>{file}> (a local file path) and imports
+every image it finds via C<_import_photo>: if the archive contains an
+C<idlink.txt>/C<datalink.txt> mapping file, each row is resolved via that
+mapping; otherwise every image file found is matched by its own filename's
+stem against C<matchpoint> directly. Each row is processed in isolation -
+one failure never aborts the rest of the batch. Rejects (without
+extracting) an archive with more than C<PHOTO_MAX_ZIP_MEMBERS>
+non-directory members. Returns C<{ imported => [...], errors => [...] }>.
+Dies with a plain string only if the zip itself cannot be read.
+
+=cut
+
+sub _import_photo_batch {
+    my ( $self, $args ) = @_;
+    my ( $zip_path, $matchpoint, $dry_run ) = @{$args}{qw( file matchpoint dry_run )};
+
+    my $zip = Archive::Zip->new;
+    die "Unable to read zip file: $zip_path\n"
+      unless $zip->read($zip_path) == Archive::Zip::AZ_OK;
+
+    my @non_dir_members = grep { !$_->isDirectory } $zip->members;
+    if ( @non_dir_members > PHOTO_MAX_ZIP_MEMBERS ) {
+        return { imported => [], errors => [ { error => 'TOO_MANY_MEMBERS' } ] };
+    }
+
+    my $extract_dir = tempdir( CLEANUP => 1 );
+    for my $member ( $zip->members ) {
+        next if $member->isDirectory;
+        my $name = $member->fileName;
+        next unless $self->_is_safe_relative_path($name);
+        $member->extractToFileNamed( File::Spec->catfile( $extract_dir, $name ) ) == Archive::Zip::AZ_OK
+          or die "Unable to extract $name from $zip_path\n";
+    }
+
+    my $result       = { imported => [], errors => [] };
+    my $mapping_file = $self->_find_photo_mapping_file($extract_dir);
+    my @rows =
+      $mapping_file
+      ? $self->_photo_rows_from_mapping_file($mapping_file)
+      : $self->_photo_rows_from_filenames($extract_dir);
+
+    for my $row (@rows) {
+        my ( $identifier, $filename ) = @{$row}{qw( identifier filename )};
+
+        if ( $row->{error} ) {
+            push @{ $result->{errors} }, { identifier => $identifier, filename => $filename, error => $row->{error} };
+            next;
+        }
+
+        my $path_error = $self->_check_photo_path_safe_and_exists( $extract_dir, $filename );
+        if ($path_error) {
+            push @{ $result->{errors} }, { identifier => $identifier, filename => $filename, error => $path_error };
+            next;
+        }
+
+        my $real_file = realpath( File::Spec->catfile( $extract_dir, $filename ) );
+        my $outcome   = eval {
+            open my $fh, '<', $real_file or die "Unable to read $real_file: $!\n";
+            my $r = $self->_import_photo(
+                { file => $fh, identifier => $identifier, matchpoint => $matchpoint, dry_run => $dry_run } );
+            close $fh;
+            $r;
+        };
+        if ($@) {
+            push @{ $result->{errors} }, { identifier => $identifier, filename => $filename, error => 'UNEXPECTED_ERROR' };
+            next;
+        }
+        if ( $outcome->{error} ) {
+            push @{ $result->{errors} }, { identifier => $identifier, filename => $filename, error => $outcome->{error} };
+        }
+        else {
+            push @{ $result->{imported} }, { identifier => $identifier, filename => $filename };
+        }
+    }
+
+    return $result;
 }
 
 =head3 install

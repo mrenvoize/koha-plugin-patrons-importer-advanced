@@ -2,13 +2,14 @@
 
 use Modern::Perl;
 
-use Test::More tests => 2;
+use Test::More tests => 4;
 
 use Koha::Database;
 use t::lib::TestBuilder;
 
 use GD;
-use File::Temp;
+use Archive::Zip qw( :ERROR_CODES );
+use File::Temp   qw( tempfile tempdir );
 
 use Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced;
 use Koha::Patron::Images;
@@ -116,4 +117,87 @@ sub _small_png_fh {
     close $fh;
     open my $read_fh, '<', $path or die "Unable to reopen $path: $!";
     return $read_fh;
+}
+
+subtest '_import_photo_batch: zip extraction and matching' => sub {
+    plan tests => 8;
+
+    $schema->storage->txn_begin;
+
+    my $plugin = Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced->new( { enable_plugins => 1 } );
+    my $png    = GD::Image->new( 10, 10, 1 )->png;
+
+    my $patron1 = $builder->build_object( { class => 'Koha::Patrons', value => { cardnumber => 'BATCHCARD1' } } );
+    my $patron2 = $builder->build_object( { class => 'Koha::Patrons', value => { cardnumber => 'BATCHCARD2' } } );
+
+    my $zip_path = _build_photo_zip(
+        {
+            'idlink.txt' => "BATCHCARD1,a.png\nBATCHCARD2,b.png\n",
+            'a.png'      => $png,
+            'b.png'      => $png,
+        }
+    );
+    my $result = $plugin->_import_photo_batch( { file => $zip_path, matchpoint => 'cardnumber' } );
+    is( scalar @{ $result->{imported} }, 2, 'manifest: two rows imported' );
+    is( scalar @{ $result->{errors} },   0, 'manifest: no errors' );
+    ok(
+        Koha::Patron::Images->find( $patron1->borrowernumber ) && Koha::Patron::Images->find( $patron2->borrowernumber ),
+        'manifest: both images stored'
+    );
+    unlink $zip_path;
+
+    my $patron3 = $builder->build_object( { class => 'Koha::Patrons', value => { cardnumber => 'STEMCARD1' } } );
+    $zip_path = _build_photo_zip( { 'STEMCARD1.png' => $png, 'notes.txt' => 'not an image' } );
+    $result = $plugin->_import_photo_batch( { file => $zip_path, matchpoint => 'cardnumber' } );
+    is( scalar @{ $result->{imported} }, 1, 'no manifest: filename-stem matched, one row imported' );
+    is( $result->{imported}[0]{identifier}, 'STEMCARD1', 'no manifest: identifier is the filename stem' );
+    unlink $zip_path;
+
+    $zip_path = _build_photo_zip(
+        {
+            'idlink.txt' => "BATCHCARD1,a.png\nNOSUCHCARD,../../../../etc/passwd\n",
+            'a.png'      => $png,
+        }
+    );
+    $result = $plugin->_import_photo_batch( { file => $zip_path, matchpoint => 'cardnumber' } );
+    is( scalar @{ $result->{imported} }, 1,             'zip-slip: the safe row still imports' );
+    is( scalar @{ $result->{errors} },   1,              'zip-slip: the traversal row is rejected, not followed' );
+    is( $result->{errors}[0]{error},     'UNSAFE_PATH',  'zip-slip: rejected specifically as an unsafe path' );
+    unlink $zip_path;
+
+    $schema->storage->txn_rollback;
+};
+
+subtest '_import_photo_batch: TOO_MANY_MEMBERS cap' => sub {
+    plan tests => 2;
+
+    $schema->storage->txn_begin;
+
+    my $plugin = Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced->new( { enable_plugins => 1 } );
+
+    my $zip = Archive::Zip->new;
+    $zip->addString( 'x', "file$_.png" ) for ( 1 .. 1001 );
+    my ( $fh, $zip_path ) = tempfile( SUFFIX => '.zip', UNLINK => 0 );
+    close $fh;
+    $zip->writeToFileNamed($zip_path) == Archive::Zip::AZ_OK or die 'Unable to write test zip';
+
+    my $result = $plugin->_import_photo_batch( { file => $zip_path, matchpoint => 'cardnumber' } );
+    is( scalar @{ $result->{errors} }, 1,                  'a single error is returned when the cap is exceeded' );
+    is( $result->{errors}[0]{error},   'TOO_MANY_MEMBERS',  'the error code is TOO_MANY_MEMBERS' );
+
+    unlink $zip_path;
+    $schema->storage->txn_rollback;
+};
+
+sub _build_photo_zip {
+    my ($files) = @_;
+
+    my $zip = Archive::Zip->new;
+    while ( my ( $name, $content ) = each %$files ) {
+        $zip->addString( $content, $name );
+    }
+    my ( $fh, $path ) = tempfile( SUFFIX => '.zip', UNLINK => 0 );
+    close $fh;
+    $zip->writeToFileNamed($path) == Archive::Zip::AZ_OK or die 'Unable to write test zip';
+    return $path;
 }
