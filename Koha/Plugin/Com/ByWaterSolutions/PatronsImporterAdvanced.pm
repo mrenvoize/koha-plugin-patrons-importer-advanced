@@ -17,7 +17,11 @@ use Koha::File::Transports;
 use Koha::Patrons::Import;
 use Koha::Patron::Attribute::Types;
 use Koha::Patron::Attributes;
+use Koha::Patron::Image;
+use Koha::Patron::Images;
 use Koha::TemplateUtils qw(process_tt);
+
+use GD;
 
 use Data::Dumper;
 use File::Temp qw(tempdir tempfile);
@@ -47,6 +51,16 @@ our $metadata = {
     description     =>
 'Automate importing patron CSV files with column mapping and transformations',
 };
+
+# Limits for _import_photo/_import_photo_batch, matching Koha core Bug
+# 43637's Koha::Patron::Image::Import (see the Phase 2 spec's "Forward
+# compatibility" section) so a future swap to that class needs no data
+# changes.
+use constant PHOTO_MAX_FILE_SIZE      => 2_097_152;    # 2MB
+use constant PHOTO_MAX_WIDTH          => 200;
+use constant PHOTO_MAX_HEIGHT         => 300;
+use constant PHOTO_IMAGE_EXTENSION_RE => qr/\.(?:jpe?g|png|gif|xpm)$/i;
+use constant PHOTO_MAX_ZIP_MEMBERS    => 1000;
 
 =head3 new
 
@@ -694,6 +708,79 @@ sub _resolve_photo_patron {
     return unless @borrowernumbers == 1;
 
     return Koha::Patrons->find( $borrowernumbers[0] );
+}
+
+=head3 _import_photo
+
+Validate, resize if needed, convert to PNG, and store an open filehandle
+(positioned at the start) as the patron image for whichever patron
+C<matchpoint>/C<identifier> resolves to. C<matchpoint> is one of
+"cardnumber", "userid", or "patron_attribute_<code>". If C<dry_run> is
+true, resolves and validates the image but does not store it.
+
+Returns C<{ success => 1 }> on success, or C<{ error => $code }> on
+failure: C<OVRSIZ> (over 2MB), C<CORERR> (GD could not read the image),
+C<PATRON_NOT_FOUND>, or C<DBERR> (storing the image failed).
+
+=cut
+
+sub _import_photo {
+    my ( $self, $args ) = @_;
+    my ( $fh, $identifier, $matchpoint, $dry_run ) = @{$args}{qw( file identifier matchpoint dry_run )};
+
+    my $size = -s $fh;
+    return { error => 'OVRSIZ' } if $size > PHOTO_MAX_FILE_SIZE;
+
+    my $srcimage = eval { GD::Image->new($fh) };
+    return { error => 'CORERR' } unless defined $srcimage;
+
+    my $patron = $self->_resolve_photo_patron( $matchpoint, $identifier );
+    return { error => 'PATRON_NOT_FOUND' } unless $patron;
+
+    my $imgfile = $self->_photo_to_png($srcimage);
+
+    if ($dry_run) {
+        say "DRY RUN: would store image for $matchpoint => $identifier (borrowernumber "
+          . $patron->borrowernumber . ")";
+        return { success => 1 };
+    }
+
+    my $image = $patron->image;
+    $image ||= Koha::Patron::Image->new( { borrowernumber => $patron->borrowernumber } );
+    $image->set( { mimetype => 'image/png', imagefile => $imgfile } );
+
+    my $stored = eval { $image->store };
+    return { error => 'DBERR' } if $@ || !$stored;
+
+    return { success => 1 };
+}
+
+=head3 _photo_to_png
+
+Convert a GD::Image to PNG bytes, resizing it first if either dimension
+exceeds 200x300, preserving aspect ratio by scaling to whichever of the
+two ratios (width or height) is smaller, so the result always fits within
+the bounding box.
+
+=cut
+
+sub _photo_to_png {
+    my ( $self, $srcimage ) = @_;
+
+    my ( $width, $height ) = $srcimage->getBounds();
+    return $srcimage->png() unless $width > PHOTO_MAX_WIDTH || $height > PHOTO_MAX_HEIGHT;
+
+    my $width_ratio  = PHOTO_MAX_WIDTH / $width;
+    my $height_ratio = PHOTO_MAX_HEIGHT / $height;
+    my $scale        = $width_ratio < $height_ratio ? $width_ratio : $height_ratio;
+
+    my $new_width  = sprintf( '%.0f', $width * $scale );
+    my $new_height = sprintf( '%.0f', $height * $scale );
+
+    my $resized = GD::Image->new( $new_width, $new_height, 1 );
+    $resized->copyResampled( $srcimage, 0, 0, 0, 0, $new_width, $new_height, $width, $height );
+
+    return $resized->png();
 }
 
 =head3 install
