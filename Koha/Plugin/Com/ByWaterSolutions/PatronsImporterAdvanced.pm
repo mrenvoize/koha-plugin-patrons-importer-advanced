@@ -1048,10 +1048,16 @@ sub _import_photo_batch {
 
 Run a single C<type: photo> job: list the configured directory on the
 job's file transport, and for every zip archive or loose image file
-found, skip it via per-(job, filename) content-hash dedup if unchanged
-since last import, otherwise download and import it (a zip via
-C<_import_photo_batch>, a loose file via C<_import_photo> keyed off its
-own filename stem), and log a per-job run summary.
+found (rejecting any listed filename containing a path separator, since
+the listing comes from the transport and cannot be trusted), skip it via
+per-(job, filename) content-hash dedup if unchanged since last import,
+otherwise download and import it (a zip via C<_import_photo_batch>, a
+loose file via C<_import_photo> keyed off its own filename stem), and
+log a per-job run summary. Dedup history is only recorded for a file
+that both actually ran for real (not C<dry_run>) and produced at least
+one successful import - a dry run, or a file that fully failed, is left
+eligible for retry on the next run rather than being permanently
+skipped based on unchanged bytes.
 
 =cut
 
@@ -1094,6 +1100,17 @@ sub _run_photo_job {
         my $filename = $file->{filename};
         next unless defined $filename;
         next unless $filename =~ /\.zip$/i || $filename =~ PHOTO_IMAGE_EXTENSION_RE;
+
+        # The listing comes from the remote transport, which may be
+        # compromised or malicious - never trust a path separator in a
+        # listed filename, or it could be used to escape the download
+        # tempdir (e.g. "../../../etc/cron.d/evil.png"), the same threat
+        # _import_photo_batch's zip-slip guard defends against one layer
+        # down, from the same untrusted source.
+        if ( $filename =~ m{[/\\]} ) {
+            say "JOB $job->{name} REJECTING UNSAFE FILENAME '$filename' FROM TRANSPORT LISTING";
+            next;
+        }
 
         my $directory  = tempdir( CLEANUP => 1 );
         my $local_path = "$directory/$filename";
@@ -1151,11 +1168,23 @@ sub _run_photo_job {
               if $verbose;
         }
 
-        $self->_record_job_run(
-            $job->{name}, $content_hash,
-            { imported => scalar @{ $result->{imported} }, errors => scalar @{ $result->{errors} } },
-            $filename
-        );
+        my $imported_count = scalar @{ $result->{imported} };
+        my $error_count    = scalar @{ $result->{errors} };
+
+        # Don't record history for a dry run (there's nothing real to skip
+        # next time), and don't record it for a file that fully failed
+        # (zero imports, at least one error) - a file that never actually
+        # imported anything should be retried next run, not permanently
+        # dedup-skipped until its bytes happen to change. A partial
+        # success (at least one import, even alongside some errors) still
+        # records normally.
+        unless ( $dry_run || ( $imported_count == 0 && $error_count > 0 ) ) {
+            $self->_record_job_run(
+                $job->{name}, $content_hash,
+                { imported => $imported_count, errors => $error_count },
+                $filename
+            );
+        }
     }
 
     if ($verbose) {
