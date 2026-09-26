@@ -15,6 +15,8 @@ use Koha::Encryption;
 use Koha::File::Transport;
 use Koha::File::Transports;
 use Koha::Patrons::Import;
+use Koha::Patron::Attribute::Types;
+use Koha::Patron::Attributes;
 use Koha::TemplateUtils qw(process_tt);
 
 use Data::Dumper;
@@ -297,8 +299,6 @@ sub cronjob_nightly {
 
     my $data = $self->get_configuration();
 
-    my $Import = Koha::Patrons::Import->new();
-
     # Load transformation subroutines from kaho-conf.xml
     my $conf_file = Koha::Config->guess_koha_conf;
     my $xml       = XMLin(
@@ -324,8 +324,7 @@ sub cronjob_nightly {
         try {
             next if $job->{disable};
 
-            my $debug   = $job->{debug}   || 0;
-            my $verbose = $job->{verbose} || 0;
+            my $debug = $job->{debug} || 0;
 
             say "Working on job: $job->{name}" if $debug;
 
@@ -344,18 +343,6 @@ sub cronjob_nightly {
                 }
             }
 
-            my $transport_id = $job->{file_transport_id};
-            unless ($transport_id) {
-                say "JOB $job->{name} HAS NO file_transport_id, SKIPPING";
-                next;
-            }
-
-            my $transport = Koha::File::Transports->find($transport_id);
-            unless ($transport) {
-                say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING";
-                next;
-            }
-
             # Guard against overlapping runs of the same job: frequent
             # scheduling means two cron ticks can otherwise both pass the
             # content-hash check before either records its run. MySQL user
@@ -369,262 +356,12 @@ sub cronjob_nightly {
                 next;
             }
 
-            my $filename    = process_tt( $job->{filename} );
-            my $directory   = tempdir( CLEANUP => 1 );
-            my $local_path  = "$directory/$filename";
-            my $download_opts = $job->{path} ? { path => process_tt( $job->{path} ) } : {};
-
-            $debug && say "Downloading '$filename' via transport #$transport_id to '$local_path'";
-
-            # Some Koha versions' SFTP transport dies rather than returning
-            # false on failure (e.g. Koha 25.11, missing JSON import) -
-            # catch that too, not just a false return, so either failure
-            # mode produces the same informative error below.
-            my $downloaded = try { $transport->download_file( $filename, $local_path, $download_opts ) } catch { 0 };
-            $downloaded
-              or die "Patrons Importer - TRANSPORT ERROR: download failed for $filename: "
-              . join( '; ', map { $_->message } @{ $transport->object_messages } );
-
-            my $filepath = $local_path;
-
-            # Write a header if needed
-            if ( my $header = $job->{file}->{header} ) {
-                my ( $new_tmp_fh, $new_tmp_filename ) = tempfile();
-                binmode( $new_tmp_fh, ":utf8" );
-
-                open my $new, '>:encoding(UTF-8)', $new_tmp_filename
-                  or die "$new_tmp_filename: $!";
-                open my $old, '<:encoding(UTF-8)', $filepath
-                  or die "$filepath: $!";
-
-                print {$new} "$header\n";
-                print {$new} $_ while <$old>;
-                close $new;
-
-                $filepath = $new_tmp_filename;
+            my $type = $job->{type} // 'record';
+            if ( $type eq 'photo' ) {
+                $self->_run_photo_job($job);
             }
-
-            my $content_hash = $self->_content_hash($filepath);
-            unless ( $self->_job_should_run( $job->{name}, $content_hash ) ) {
-                say "No changes since last run for job $job->{name}, skipping" if $debug || $verbose;
-                next;
-            }
-
-            my $options = $job->{csv_options} || {};
-            my $inputs = Text::CSV::Slurp->load( file => $filepath, %$options );
-
-            my @output_data;
-            foreach my $input (@$inputs) {
-                $debug && say "WORKING ON " . Data::Dumper::Dumper($input);
-
-                if ( $input->{disabled} ) {
-                    say "DISABLED, SKIPPING...";
-                    next;
-                }
-
-                my $skip = 0;
-                foreach my $input_column ( keys %{ $job->{skip_incoming} } ) {
-                    my $values = $job->{skip_incoming}->{$input_column};
-                    foreach my $value (@$values) {
-                        if ( defined $input->{$input_column}
-                            && $input->{$input_column} eq $value )
-                        {
-                            $debug
-                              && say
-"SKIPPING: Row has column '$input_column' value of $value, skipping!";
-                            $skip = 1;
-                            last;
-                        }
-                    }
-                }
-                next if $skip;
-
-                my $output = {};
-                my $stash  = {};
-
-                my $columns = $job->{columns};
-                foreach my $column (@$columns) {
-                    my $output_column = $column->{output};
-                    say "NO OUPUT SPECIFIED FOR "
-                      . Data::Dumper::Dumper($column)
-                      unless $output;
-
-                    if ( defined $column->{static} ) {
-                        my $static_value = $column->{static};
-                        $output->{$output_column} = $static_value;
-                    }
-                    elsif ( defined $column->{input} ) {
-                        my $input_column = $column->{input};
-                        my $value        = $input->{$input_column} // q{};
-                        my $prefix       = $column->{prefix}       // q{};
-                        my $padding      = $column->{padding}      // q{};
-                        my $length       = $column->{length}       // 0;
-
-                        my $padding_length =
-                          $length - length($prefix) - length($value);
-                        $padding_length = 0 if $padding_length < 0;
-                        $padding        = $padding x $padding_length;
-
-                        $value = $prefix . $padding . $value;
-                        $output->{$output_column} = $value;
-                    }
-                    elsif ( defined $column->{mapping} ) {
-                        my $mapping = $column->{mapping};
-                        my $source  = $mapping->{source};
-                        my $map     = $mapping->{map};
-
-                        my $input_value = $input->{$source};
-                        my $value       = $map->{$input_value};
-                        $output->{$output_column} = $value;
-                    }
-                    elsif ( defined $column->{transformer} ) {
-                        my $sub_name = $column->{transformer};
-                        my $sub      = $transformers->{$sub_name};
-                        die "NO TRANSFORMER NAMED $sub_name DEFINED"
-                          unless $sub;
-
-                        try {
-                            &$sub( $input, $output, $stash, $job );
-                        }
-                        catch {
-                            warn
-"Call to transformer $sub_name failed with errors: $_";
-                        };
-                    }
-                }
-
-                $debug && say "OUTPUT: " . Data::Dumper::Dumper($output);
-
-                if ( $job->{delete_incoming} ) {
-                    my $criteria = $job->{delete_incoming};
-
-                    my $delete = 0;
-
-                    foreach my $c (@$criteria) {
-                        my $field      = $c->{field};
-                        my $value      = $c->{value};
-                        my $comparison = $c->{comparison};
-
-                        next
-                          unless defined($field)
-                          && defined($value)
-                          && defined($comparison);
-
-                        if ( $comparison eq 'equals' ) {
-                            $delete = 1
-                              if defined( $output->{$field} )
-                              && $output->{$field} eq $value;
-                        }
-                        elsif ( $comparison eq 'not_equals' ) {
-                            $delete = 1
-                              if defined( $output->{$field} )
-                              && $output->{$field} ne $value;
-                        }
-
-                        say "DELETING $output->{cardnumber} BECAUSE "
-                          . Data::Dumper::Dumper($c)
-                          if $delete && $verbose;
-
-                        if ($delete) {
-                            delete_if_found( $output, $job );
-                        }
-                        else {
-                            push( @output_data, $output );
-                        }
-                    }
-
-                    delete_if_found( $output, $job ) if $delete;
-                }
-                else {
-                    push( @output_data, $output );
-                }
-            }
-
-            my ( $tmp_fh, $tmp_filename ) = tempfile();
-            binmode( $tmp_fh, ":utf8" );
-            my $csv = Text::CSV::Slurp->create( input => \@output_data );
-            print $tmp_fh $csv;
-            close $tmp_fh;
-
-            # Reopen file handle for reading
-            my $handle;
-            open( $handle, "<:encoding(UTF-8)", $tmp_filename ) or die $!;
-
-            my $params = $job->{parameters};
-            my $return = $Import->import_patrons(
-                {
-                    file => $handle,
-                    %$params,
-                }
-            );
-
-            my $feedback    = $return->{feedback};
-            my $errors      = $return->{errors};
-            my $imported    = $return->{imported};
-            my $overwritten = $return->{overwritten};
-            my $alreadyindb = $return->{already_in_db};
-            my $invalid     = $return->{invalid};
-            my $total = $imported + $alreadyindb + $invalid + $overwritten;
-
-            if ($verbose) {
-                say q{};
-                say "Import complete:";
-                say "Imported:    $imported";
-                say "Overwritten: $overwritten";
-                say "Skipped:     $alreadyindb";
-                say "Invalid:     $invalid";
-                say "Total:       $total";
-                say q{};
-            }
-
-            $self->_record_job_run(
-                $job->{name}, $content_hash,
-                { imported => $imported, overwritten => $overwritten, already_in_db => $alreadyindb, invalid => $invalid }
-            );
-
-            if ( my $email_conf = $job->{email_results} ) {
-
-                $email_conf->{text_body} = qq{
-Import complete for $job->{name}:
-Imported:    $imported
-Overwritten: $overwritten
-Skipped:     $alreadyindb
-Invalid:     $invalid
-Total:       $total
-                };
-
-                my $email = Koha::Email->create($email_conf);
-
-                try {
-                    $email->send_or_die();
-                }
-                catch {
-                    warn "ERROR: Failed to send email for job $job->{name}: $_";
-                }
-            }
-
-            if ( $verbose > 1 ) {
-                say "Errors:";
-                say Data::Dumper::Dumper($errors);
-            }
-
-            if ( $verbose > 2 ) {
-                say "Feedback:";
-                say Data::Dumper::Dumper($feedback);
-            }
-
-            if ( $job->{post_import_transformer} ) {
-                my $sub_name = $job->{post_import_transformer};
-                my $sub      = $transformers->{$sub_name};
-                die "NO TRANSFORMER NAMED $sub_name DEFINED"
-                  unless $sub;
-
-                try {
-                    &$sub( \@output_data, $job );
-                }
-                catch {
-                    warn "Call to transformer $sub_name failed with errors: $_";
-                };
+            else {
+                $self->_run_record_job( $job, $transformers );
             }
 
         }
@@ -638,6 +375,325 @@ Total:       $total
               if $lock_acquired;
         };
     }
+}
+
+=head3 _run_record_job
+
+Run a single C<type: record> (CSV patron import) job: download its source
+file via the configured transport, apply column mapping/transformation,
+skip re-importing unchanged content, hand the result to
+C<Koha::Patrons::Import>, and record/report the outcome.
+
+=cut
+
+sub _run_record_job {
+    my ( $self, $job, $transformers ) = @_;
+
+    my $debug   = $job->{debug}   || 0;
+    my $verbose = $job->{verbose} || 0;
+
+    my $transport_id = $job->{file_transport_id};
+    unless ($transport_id) {
+        say "JOB $job->{name} HAS NO file_transport_id, SKIPPING";
+        return;
+    }
+
+    my $transport = Koha::File::Transports->find($transport_id);
+    unless ($transport) {
+        say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING";
+        return;
+    }
+
+    my $filename       = process_tt( $job->{filename} );
+    my $directory      = tempdir( CLEANUP => 1 );
+    my $local_path     = "$directory/$filename";
+    my $download_opts = $job->{path} ? { path => process_tt( $job->{path} ) } : {};
+
+    $debug && say "Downloading '$filename' via transport #$transport_id to '$local_path'";
+
+    # Some Koha versions' SFTP transport dies rather than returning
+    # false on failure (e.g. Koha 25.11, missing JSON import) -
+    # catch that too, not just a false return, so either failure
+    # mode produces the same informative error below.
+    my $downloaded = try { $transport->download_file( $filename, $local_path, $download_opts ) } catch { 0 };
+    $downloaded
+      or die "Patrons Importer - TRANSPORT ERROR: download failed for $filename: "
+      . join( '; ', map { $_->message } @{ $transport->object_messages } );
+
+    my $filepath = $local_path;
+
+    # Write a header if needed
+    if ( my $header = $job->{file}->{header} ) {
+        my ( $new_tmp_fh, $new_tmp_filename ) = tempfile();
+        binmode( $new_tmp_fh, ":utf8" );
+
+        open my $new, '>:encoding(UTF-8)', $new_tmp_filename
+          or die "$new_tmp_filename: $!";
+        open my $old, '<:encoding(UTF-8)', $filepath
+          or die "$filepath: $!";
+
+        print {$new} "$header\n";
+        print {$new} $_ while <$old>;
+        close $new;
+
+        $filepath = $new_tmp_filename;
+    }
+
+    my $content_hash = $self->_content_hash($filepath);
+    unless ( $self->_job_should_run( $job->{name}, $content_hash ) ) {
+        say "No changes since last run for job $job->{name}, skipping" if $debug || $verbose;
+        return;
+    }
+
+    my $options = $job->{csv_options} || {};
+    my $inputs = Text::CSV::Slurp->load( file => $filepath, %$options );
+
+    my @output_data;
+    foreach my $input (@$inputs) {
+        $debug && say "WORKING ON " . Data::Dumper::Dumper($input);
+
+        if ( $input->{disabled} ) {
+            say "DISABLED, SKIPPING...";
+            next;
+        }
+
+        my $skip = 0;
+        foreach my $input_column ( keys %{ $job->{skip_incoming} } ) {
+            my $values = $job->{skip_incoming}->{$input_column};
+            foreach my $value (@$values) {
+                if ( defined $input->{$input_column}
+                    && $input->{$input_column} eq $value )
+                {
+                    $debug
+                      && say
+"SKIPPING: Row has column '$input_column' value of $value, skipping!";
+                    $skip = 1;
+                    last;
+                }
+            }
+        }
+        next if $skip;
+
+        my $output = {};
+        my $stash  = {};
+
+        my $columns = $job->{columns};
+        foreach my $column (@$columns) {
+            my $output_column = $column->{output};
+            say "NO OUPUT SPECIFIED FOR "
+              . Data::Dumper::Dumper($column)
+              unless $output;
+
+            if ( defined $column->{static} ) {
+                my $static_value = $column->{static};
+                $output->{$output_column} = $static_value;
+            }
+            elsif ( defined $column->{input} ) {
+                my $input_column = $column->{input};
+                my $value        = $input->{$input_column} // q{};
+                my $prefix       = $column->{prefix}       // q{};
+                my $padding      = $column->{padding}      // q{};
+                my $length       = $column->{length}       // 0;
+
+                my $padding_length =
+                  $length - length($prefix) - length($value);
+                $padding_length = 0 if $padding_length < 0;
+                $padding        = $padding x $padding_length;
+
+                $value = $prefix . $padding . $value;
+                $output->{$output_column} = $value;
+            }
+            elsif ( defined $column->{mapping} ) {
+                my $mapping = $column->{mapping};
+                my $source  = $mapping->{source};
+                my $map     = $mapping->{map};
+
+                my $input_value = $input->{$source};
+                my $value       = $map->{$input_value};
+                $output->{$output_column} = $value;
+            }
+            elsif ( defined $column->{transformer} ) {
+                my $sub_name = $column->{transformer};
+                my $sub      = $transformers->{$sub_name};
+                die "NO TRANSFORMER NAMED $sub_name DEFINED"
+                  unless $sub;
+
+                try {
+                    &$sub( $input, $output, $stash, $job );
+                }
+                catch {
+                    warn
+"Call to transformer $sub_name failed with errors: $_";
+                };
+            }
+        }
+
+        $debug && say "OUTPUT: " . Data::Dumper::Dumper($output);
+
+        if ( $job->{delete_incoming} ) {
+            my $criteria = $job->{delete_incoming};
+
+            my $delete = 0;
+
+            foreach my $c (@$criteria) {
+                my $field      = $c->{field};
+                my $value      = $c->{value};
+                my $comparison = $c->{comparison};
+
+                next
+                  unless defined($field)
+                  && defined($value)
+                  && defined($comparison);
+
+                if ( $comparison eq 'equals' ) {
+                    $delete = 1
+                      if defined( $output->{$field} )
+                      && $output->{$field} eq $value;
+                }
+                elsif ( $comparison eq 'not_equals' ) {
+                    $delete = 1
+                      if defined( $output->{$field} )
+                      && $output->{$field} ne $value;
+                }
+
+                say "DELETING $output->{cardnumber} BECAUSE "
+                  . Data::Dumper::Dumper($c)
+                  if $delete && $verbose;
+
+                if ($delete) {
+                    delete_if_found( $output, $job );
+                }
+                else {
+                    push( @output_data, $output );
+                }
+            }
+
+            delete_if_found( $output, $job ) if $delete;
+        }
+        else {
+            push( @output_data, $output );
+        }
+    }
+
+    my ( $tmp_fh, $tmp_filename ) = tempfile();
+    binmode( $tmp_fh, ":utf8" );
+    my $csv = Text::CSV::Slurp->create( input => \@output_data );
+    print $tmp_fh $csv;
+    close $tmp_fh;
+
+    # Reopen file handle for reading
+    my $handle;
+    open( $handle, "<:encoding(UTF-8)", $tmp_filename ) or die $!;
+
+    my $Import = Koha::Patrons::Import->new();
+    my $params = $job->{parameters};
+    my $return = $Import->import_patrons(
+        {
+            file => $handle,
+            %$params,
+        }
+    );
+
+    my $feedback    = $return->{feedback};
+    my $errors      = $return->{errors};
+    my $imported    = $return->{imported};
+    my $overwritten = $return->{overwritten};
+    my $alreadyindb = $return->{already_in_db};
+    my $invalid     = $return->{invalid};
+    my $total = $imported + $alreadyindb + $invalid + $overwritten;
+
+    if ($verbose) {
+        say q{};
+        say "Import complete:";
+        say "Imported:    $imported";
+        say "Overwritten: $overwritten";
+        say "Skipped:     $alreadyindb";
+        say "Invalid:     $invalid";
+        say "Total:       $total";
+        say q{};
+    }
+
+    $self->_record_job_run(
+        $job->{name}, $content_hash,
+        { imported => $imported, overwritten => $overwritten, already_in_db => $alreadyindb, invalid => $invalid }
+    );
+
+    if ( my $email_conf = $job->{email_results} ) {
+
+        $email_conf->{text_body} = qq{
+Import complete for $job->{name}:
+Imported:    $imported
+Overwritten: $overwritten
+Skipped:     $alreadyindb
+Invalid:     $invalid
+Total:       $total
+        };
+
+        my $email = Koha::Email->create($email_conf);
+
+        try {
+            $email->send_or_die();
+        }
+        catch {
+            warn "ERROR: Failed to send email for job $job->{name}: $_";
+        }
+    }
+
+    if ( $verbose > 1 ) {
+        say "Errors:";
+        say Data::Dumper::Dumper($errors);
+    }
+
+    if ( $verbose > 2 ) {
+        say "Feedback:";
+        say Data::Dumper::Dumper($feedback);
+    }
+
+    if ( $job->{post_import_transformer} ) {
+        my $sub_name = $job->{post_import_transformer};
+        my $sub      = $transformers->{$sub_name};
+        die "NO TRANSFORMER NAMED $sub_name DEFINED"
+          unless $sub;
+
+        try {
+            &$sub( \@output_data, $job );
+        }
+        catch {
+            warn "Call to transformer $sub_name failed with errors: $_";
+        };
+    }
+}
+
+=head3 _resolve_photo_patron
+
+Resolve a patron from a matchpoint field name ("cardnumber", "userid", or
+"patron_attribute_<code>") and an identifier value. Mirrors Koha core Bug
+43637's C<Koha::Patron::Image::Import::_resolve_patron> (independent
+implementation, same algorithm - see the Phase 2 spec's "Forward
+compatibility" section). Returns a C<Koha::Patron> or undef if nothing
+matches.
+
+=cut
+
+sub _resolve_photo_patron {
+    my ( $self, $matchpoint, $identifier ) = @_;
+
+    return unless defined $identifier && length $identifier;
+
+    return Koha::Patrons->find( { $matchpoint => $identifier } )
+      if $matchpoint eq 'cardnumber' || $matchpoint eq 'userid';
+
+    my ($code) = $matchpoint =~ /^patron_attribute_(.+)$/;
+    return unless $code;
+
+    my $attribute_type = Koha::Patron::Attribute::Types->find($code);
+    return unless $attribute_type && $attribute_type->unique_id;
+
+    my @borrowernumbers =
+      Koha::Patron::Attributes->search( { code => $code, attribute => $identifier } )->get_column('borrowernumber');
+    return unless @borrowernumbers == 1;
+
+    return Koha::Patrons->find( $borrowernumbers[0] );
 }
 
 =head3 install
