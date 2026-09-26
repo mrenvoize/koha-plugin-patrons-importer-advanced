@@ -2,7 +2,7 @@
 
 use Modern::Perl;
 
-use Test::More tests => 5;
+use Test::More tests => 6;
 
 use Koha::Database;
 use t::lib::TestBuilder;
@@ -11,7 +11,10 @@ use GD;
 use Archive::Zip qw( :ERROR_CODES );
 use File::Temp   qw( tempfile tempdir );
 use File::Spec;
+use YAML::XS qw(Dump);
 
+use C4::Context;
+use Koha::Encryption;
 use Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced;
 use Koha::Patron::Images;
 
@@ -232,6 +235,90 @@ subtest '_import_photo_batch: symlink members are skipped, not followed' => sub 
     );
 
     unlink $zip_path;
+    $schema->storage->txn_rollback;
+};
+
+subtest '_run_photo_job: end-to-end via cronjob_nightly' => sub {
+    plan tests => 6;
+
+    $schema->storage->txn_begin;
+
+    my $patron_loose = $builder->build_object( { class => 'Koha::Patrons', value => { cardnumber => 'LOOSECARD1' } } );
+    my $patron_zip1   = $builder->build_object( { class => 'Koha::Patrons', value => { cardnumber => 'ZIPCARD1' } } );
+    my $patron_zip2   = $builder->build_object( { class => 'Koha::Patrons', value => { cardnumber => 'ZIPCARD2' } } );
+
+    my $remote_dir = tempdir( CLEANUP => 1 );
+    my $png        = GD::Image->new( 10, 10, 1 )->png;
+
+    open my $loose_fh, '>', "$remote_dir/LOOSECARD1.png" or die $!;
+    binmode $loose_fh;
+    print $loose_fh $png;
+    close $loose_fh;
+
+    open my $ignored_fh, '>', "$remote_dir/notes.txt" or die $!;
+    print $ignored_fh 'irrelevant';
+    close $ignored_fh;
+
+    my $zip = Archive::Zip->new;
+    $zip->addString( "ZIPCARD1,a.png\nZIPCARD2,b.png\n", 'idlink.txt' );
+    $zip->addString( $png, 'a.png' );
+    $zip->addString( $png, 'b.png' );
+    $zip->writeToFileNamed("$remote_dir/photos.zip") == Archive::Zip::AZ_OK or die 'Unable to write test zip';
+
+    my $transport = $builder->build_object(
+        {
+            class => 'Koha::File::Transports',
+            value => {
+                transport => 'local', auth_mode => 'noauth', download_directory => $remote_dir, upload_directory => '',
+                host => '', port => 22, user_name => undef, password => undef, key_file => undef, passive => 1,
+            },
+        }
+    );
+
+    my $plugin = Koha::Plugin::Com::ByWaterSolutions::PatronsImporterAdvanced->new( { enable_plugins => 1 } );
+    $plugin->store_data(
+        {
+            configuration => Koha::Encryption->new->encrypt_hex(
+                Dump(
+                    [
+                        {
+                            name              => 'Photo job',
+                            type              => 'photo',
+                            file_transport_id => $transport->id,
+                            matchpoint        => 'cardnumber',
+                        },
+                    ]
+                )
+            ),
+        }
+    );
+
+    $plugin->cronjob_nightly();
+
+    ok( Koha::Patron::Images->find( $patron_loose->borrowernumber ), 'loose file matched by filename stem' );
+    ok( Koha::Patron::Images->find( $patron_zip1->borrowernumber ),  'zip manifest row 1 imported' );
+    ok( Koha::Patron::Images->find( $patron_zip2->borrowernumber ),  'zip manifest row 2 imported' );
+
+    # Second run with unchanged source files: both dedup-skip, no re-processing.
+    Koha::Patron::Images->find( $patron_loose->borrowernumber )->delete;
+    $plugin->cronjob_nightly();
+    ok( !Koha::Patron::Images->find( $patron_loose->borrowernumber ), 'unchanged loose file is dedup-skipped on second run' );
+
+    # Changing the loose file's content causes it to be re-imported.
+    my $bigger_png = GD::Image->new( 20, 20, 1 )->png;
+    open my $changed_fh, '>', "$remote_dir/LOOSECARD1.png" or die $!;
+    binmode $changed_fh;
+    print $changed_fh $bigger_png;
+    close $changed_fh;
+    $plugin->cronjob_nightly();
+    ok( Koha::Patron::Images->find( $patron_loose->borrowernumber ), 'changed loose file content is re-imported' );
+
+    my $other_session = C4::Context->dbh->clone;
+    my ($acquirable) =
+      $other_session->selectrow_array( q{SELECT GET_LOCK(?, 0)}, undef, 'PatronsImporterAdvanced:Photo job' );
+    is( $acquirable, 1, 'lock is free again after a photo job run' );
+    $other_session->selectrow_array( q{SELECT RELEASE_LOCK(?)}, undef, 'PatronsImporterAdvanced:Photo job' );
+
     $schema->storage->txn_rollback;
 };
 

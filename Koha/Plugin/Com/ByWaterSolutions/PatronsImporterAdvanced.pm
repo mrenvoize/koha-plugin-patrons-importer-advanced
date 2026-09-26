@@ -1044,6 +1044,130 @@ sub _import_photo_batch {
     return $result;
 }
 
+=head3 _run_photo_job
+
+Run a single C<type: photo> job: list the configured directory on the
+job's file transport, and for every zip archive or loose image file
+found, skip it via per-(job, filename) content-hash dedup if unchanged
+since last import, otherwise download and import it (a zip via
+C<_import_photo_batch>, a loose file via C<_import_photo> keyed off its
+own filename stem), and log a per-job run summary.
+
+=cut
+
+sub _run_photo_job {
+    my ( $self, $job ) = @_;
+
+    my $debug   = $job->{debug}   || 0;
+    my $verbose = $job->{verbose} || 0;
+
+    my $transport_id = $job->{file_transport_id};
+    unless ($transport_id) {
+        say "JOB $job->{name} HAS NO file_transport_id, SKIPPING";
+        return;
+    }
+
+    my $transport = Koha::File::Transports->find($transport_id);
+    unless ($transport) {
+        say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING";
+        return;
+    }
+
+    my $matchpoint = $job->{matchpoint};
+    unless ($matchpoint) {
+        say "JOB $job->{name} HAS NO matchpoint CONFIGURED, SKIPPING";
+        return;
+    }
+
+    my $list_opts = $job->{path} ? { path => process_tt( $job->{path} ) } : {};
+    my $files = try { $transport->list_files($list_opts) } catch { undef };
+    unless ($files) {
+        say "JOB $job->{name} UNABLE TO LIST FILES: "
+          . join( '; ', map { $_->message } @{ $transport->object_messages } );
+        return;
+    }
+
+    my $dry_run = $job->{parameters}->{dry_run};
+    my $summary = { imported => 0, skipped => 0, errors => {} };
+
+    foreach my $file (@$files) {
+        my $filename = $file->{filename};
+        next unless defined $filename;
+        next unless $filename =~ /\.zip$/i || $filename =~ PHOTO_IMAGE_EXTENSION_RE;
+
+        my $directory  = tempdir( CLEANUP => 1 );
+        my $local_path = "$directory/$filename";
+
+        $debug && say "Downloading '$filename' via transport #$transport_id to '$local_path'";
+
+        my $downloaded = try { $transport->download_file( $filename, $local_path, $list_opts ) } catch { 0 };
+        unless ($downloaded) {
+            say "JOB $job->{name} FAILED TO DOWNLOAD $filename: "
+              . join( '; ', map { $_->message } @{ $transport->object_messages } );
+            next;
+        }
+
+        my $content_hash = $self->_content_hash($local_path);
+        unless ( $self->_job_should_run( $job->{name}, $content_hash, $filename ) ) {
+            say "No changes since last run for $job->{name}:$filename, skipping" if $debug || $verbose;
+            $summary->{skipped}++;
+            next;
+        }
+
+        my $result;
+        if ( $filename =~ /\.zip$/i ) {
+            $result = eval {
+                $self->_import_photo_batch( { file => $local_path, matchpoint => $matchpoint, dry_run => $dry_run } );
+            };
+            if ($@) {
+                say "JOB $job->{name} FAILED TO PROCESS ZIP $filename: $@";
+                next;
+            }
+        }
+        else {
+            my ($identifier) = $filename =~ /^(.+)\.[^.]+$/;
+            my $outcome = eval {
+                open my $fh, '<', $local_path or die "Unable to read $local_path: $!\n";
+                my $r = $self->_import_photo(
+                    { file => $fh, identifier => $identifier, matchpoint => $matchpoint, dry_run => $dry_run } );
+                close $fh;
+                $r;
+            };
+            if ($@) {
+                say "JOB $job->{name} FAILED TO PROCESS $filename: $@";
+                next;
+            }
+            $result =
+              $outcome->{error}
+              ? { imported => [], errors => [ { identifier => $identifier, filename => $filename, error => $outcome->{error} } ] }
+              : { imported => [ { identifier => $identifier, filename => $filename } ], errors => [] };
+        }
+
+        $summary->{imported} += scalar @{ $result->{imported} };
+        foreach my $error ( @{ $result->{errors} } ) {
+            $summary->{errors}->{ $error->{error} }++;
+            say "  error: $error->{error} (identifier="
+              . ( $error->{identifier} // '' ) . ", filename=" . ( $error->{filename} // '' ) . ")"
+              if $verbose;
+        }
+
+        $self->_record_job_run(
+            $job->{name}, $content_hash,
+            { imported => scalar @{ $result->{imported} }, errors => scalar @{ $result->{errors} } },
+            $filename
+        );
+    }
+
+    if ($verbose) {
+        say q{};
+        say "Photo import complete for $job->{name}:";
+        say "Imported: $summary->{imported}";
+        say "Skipped:  $summary->{skipped}";
+        say "Errors:   " . join( ', ', map { "$_=$summary->{errors}->{$_}" } sort keys %{ $summary->{errors} } );
+        say q{};
+    }
+}
+
 =head3 install
 
 This is the 'install' method. Any database tables or other setup that should

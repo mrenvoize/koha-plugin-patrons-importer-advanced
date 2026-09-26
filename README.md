@@ -93,6 +93,45 @@ Caveats carried over from the `file_transport:` block this replaces:
 * Key file authentication requires Koha 26.05 or later.
 * On Koha 25.11, a `local` transport ignores a job's `path` override when the transport itself has its own download directory configured.
 
+## Photo import jobs
+
+A job can import patron photos instead of a CSV of patron records by
+setting `type: photo`:
+
+```yaml
+- name: Nightly photo import
+  type: photo
+  file_transport_id: 5
+  path: /incoming/photos          # directory to list on the transport
+  matchpoint: cardnumber          # cardnumber | userid | patron_attribute_<code>
+  run_on_dow: 1,2,3,4,5
+  parameters:
+    dry_run: 0
+```
+
+Each run lists the configured directory and processes every entry found:
+
+* A `.zip` archive is extracted (safely - a malicious or malformed path
+  inside the archive is rejected, never followed) and its images matched
+  either via a sidecar `idlink.txt`/`datalink.txt` mapping file (the same
+  format Koha's own Tools > Patron photo upload page uses for batch
+  uploads), or, if no such file is present, by each image's own filename
+  (minus extension) against `matchpoint` directly.
+* A loose image file (`.jpg`, `.jpeg`, `.png`, `.gif`, or `.xpm`) sitting
+  directly in the directory is matched the same way: its filename minus
+  extension is looked up via `matchpoint`.
+* Anything else in the directory listing is ignored.
+
+Images are resized to a maximum of 200x300 pixels (preserving aspect
+ratio) and converted to PNG, matching Koha's own manual patron photo
+upload tool. A job whose source file for a given filename hasn't changed
+since its last successful run is skipped, just like CSV jobs - so a photo
+job is just as safe to schedule more than once a day as a record job.
+
+If a job in the list omits the `type` key entirely, it is treated as
+`type: record` for full backward compatibility with every job configured
+before this feature existed - no upgrade or migration step is required.
+
 The transformers are stored within the `config` block of the Koha configuration file:
 ```xml
  <patrons_importer_advanced>
