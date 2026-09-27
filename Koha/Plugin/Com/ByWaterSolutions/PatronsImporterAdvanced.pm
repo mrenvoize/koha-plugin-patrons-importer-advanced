@@ -15,7 +15,16 @@ use Koha::Encryption;
 use Koha::File::Transport;
 use Koha::File::Transports;
 use Koha::Patrons::Import;
+use Koha::Patron::Attribute::Types;
+use Koha::Patron::Attributes;
+use Koha::Patron::Image;
+use Koha::Patron::Images;
 use Koha::TemplateUtils qw(process_tt);
+
+use GD;
+use Archive::Zip qw( :ERROR_CODES );
+use Cwd          qw( realpath );
+use File::Spec;
 
 use Data::Dumper;
 use File::Temp qw(tempdir tempfile);
@@ -45,6 +54,16 @@ our $metadata = {
     description     =>
 'Automate importing patron CSV files with column mapping and transformations',
 };
+
+# Limits for _import_photo/_import_photo_batch, matching Koha core Bug
+# 43637's Koha::Patron::Image::Import (see the Phase 2 spec's "Forward
+# compatibility" section) so a future swap to that class needs no data
+# changes.
+use constant PHOTO_MAX_FILE_SIZE      => 2_097_152;    # 2MB
+use constant PHOTO_MAX_WIDTH          => 200;
+use constant PHOTO_MAX_HEIGHT         => 300;
+use constant PHOTO_IMAGE_EXTENSION_RE => qr/\.(?:jpe?g|png|gif|xpm)$/i;
+use constant PHOTO_MAX_ZIP_MEMBERS    => 1000;
 
 =head3 new
 
@@ -297,8 +316,6 @@ sub cronjob_nightly {
 
     my $data = $self->get_configuration();
 
-    my $Import = Koha::Patrons::Import->new();
-
     # Load transformation subroutines from kaho-conf.xml
     my $conf_file = Koha::Config->guess_koha_conf;
     my $xml       = XMLin(
@@ -324,8 +341,7 @@ sub cronjob_nightly {
         try {
             next if $job->{disable};
 
-            my $debug   = $job->{debug}   || 0;
-            my $verbose = $job->{verbose} || 0;
+            my $debug = $job->{debug} || 0;
 
             say "Working on job: $job->{name}" if $debug;
 
@@ -344,18 +360,6 @@ sub cronjob_nightly {
                 }
             }
 
-            my $transport_id = $job->{file_transport_id};
-            unless ($transport_id) {
-                say "JOB $job->{name} HAS NO file_transport_id, SKIPPING";
-                next;
-            }
-
-            my $transport = Koha::File::Transports->find($transport_id);
-            unless ($transport) {
-                say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING";
-                next;
-            }
-
             # Guard against overlapping runs of the same job: frequent
             # scheduling means two cron ticks can otherwise both pass the
             # content-hash check before either records its run. MySQL user
@@ -369,262 +373,12 @@ sub cronjob_nightly {
                 next;
             }
 
-            my $filename    = process_tt( $job->{filename} );
-            my $directory   = tempdir( CLEANUP => 1 );
-            my $local_path  = "$directory/$filename";
-            my $download_opts = $job->{path} ? { path => process_tt( $job->{path} ) } : {};
-
-            $debug && say "Downloading '$filename' via transport #$transport_id to '$local_path'";
-
-            # Some Koha versions' SFTP transport dies rather than returning
-            # false on failure (e.g. Koha 25.11, missing JSON import) -
-            # catch that too, not just a false return, so either failure
-            # mode produces the same informative error below.
-            my $downloaded = try { $transport->download_file( $filename, $local_path, $download_opts ) } catch { 0 };
-            $downloaded
-              or die "Patrons Importer - TRANSPORT ERROR: download failed for $filename: "
-              . join( '; ', map { $_->message } @{ $transport->object_messages } );
-
-            my $filepath = $local_path;
-
-            # Write a header if needed
-            if ( my $header = $job->{file}->{header} ) {
-                my ( $new_tmp_fh, $new_tmp_filename ) = tempfile();
-                binmode( $new_tmp_fh, ":utf8" );
-
-                open my $new, '>:encoding(UTF-8)', $new_tmp_filename
-                  or die "$new_tmp_filename: $!";
-                open my $old, '<:encoding(UTF-8)', $filepath
-                  or die "$filepath: $!";
-
-                print {$new} "$header\n";
-                print {$new} $_ while <$old>;
-                close $new;
-
-                $filepath = $new_tmp_filename;
+            my $type = $job->{type} // 'record';
+            if ( $type eq 'photo' ) {
+                $self->_run_photo_job($job);
             }
-
-            my $content_hash = $self->_content_hash($filepath);
-            unless ( $self->_job_should_run( $job->{name}, $content_hash ) ) {
-                say "No changes since last run for job $job->{name}, skipping" if $debug || $verbose;
-                next;
-            }
-
-            my $options = $job->{csv_options} || {};
-            my $inputs = Text::CSV::Slurp->load( file => $filepath, %$options );
-
-            my @output_data;
-            foreach my $input (@$inputs) {
-                $debug && say "WORKING ON " . Data::Dumper::Dumper($input);
-
-                if ( $input->{disabled} ) {
-                    say "DISABLED, SKIPPING...";
-                    next;
-                }
-
-                my $skip = 0;
-                foreach my $input_column ( keys %{ $job->{skip_incoming} } ) {
-                    my $values = $job->{skip_incoming}->{$input_column};
-                    foreach my $value (@$values) {
-                        if ( defined $input->{$input_column}
-                            && $input->{$input_column} eq $value )
-                        {
-                            $debug
-                              && say
-"SKIPPING: Row has column '$input_column' value of $value, skipping!";
-                            $skip = 1;
-                            last;
-                        }
-                    }
-                }
-                next if $skip;
-
-                my $output = {};
-                my $stash  = {};
-
-                my $columns = $job->{columns};
-                foreach my $column (@$columns) {
-                    my $output_column = $column->{output};
-                    say "NO OUPUT SPECIFIED FOR "
-                      . Data::Dumper::Dumper($column)
-                      unless $output;
-
-                    if ( defined $column->{static} ) {
-                        my $static_value = $column->{static};
-                        $output->{$output_column} = $static_value;
-                    }
-                    elsif ( defined $column->{input} ) {
-                        my $input_column = $column->{input};
-                        my $value        = $input->{$input_column} // q{};
-                        my $prefix       = $column->{prefix}       // q{};
-                        my $padding      = $column->{padding}      // q{};
-                        my $length       = $column->{length}       // 0;
-
-                        my $padding_length =
-                          $length - length($prefix) - length($value);
-                        $padding_length = 0 if $padding_length < 0;
-                        $padding        = $padding x $padding_length;
-
-                        $value = $prefix . $padding . $value;
-                        $output->{$output_column} = $value;
-                    }
-                    elsif ( defined $column->{mapping} ) {
-                        my $mapping = $column->{mapping};
-                        my $source  = $mapping->{source};
-                        my $map     = $mapping->{map};
-
-                        my $input_value = $input->{$source};
-                        my $value       = $map->{$input_value};
-                        $output->{$output_column} = $value;
-                    }
-                    elsif ( defined $column->{transformer} ) {
-                        my $sub_name = $column->{transformer};
-                        my $sub      = $transformers->{$sub_name};
-                        die "NO TRANSFORMER NAMED $sub_name DEFINED"
-                          unless $sub;
-
-                        try {
-                            &$sub( $input, $output, $stash, $job );
-                        }
-                        catch {
-                            warn
-"Call to transformer $sub_name failed with errors: $_";
-                        };
-                    }
-                }
-
-                $debug && say "OUTPUT: " . Data::Dumper::Dumper($output);
-
-                if ( $job->{delete_incoming} ) {
-                    my $criteria = $job->{delete_incoming};
-
-                    my $delete = 0;
-
-                    foreach my $c (@$criteria) {
-                        my $field      = $c->{field};
-                        my $value      = $c->{value};
-                        my $comparison = $c->{comparison};
-
-                        next
-                          unless defined($field)
-                          && defined($value)
-                          && defined($comparison);
-
-                        if ( $comparison eq 'equals' ) {
-                            $delete = 1
-                              if defined( $output->{$field} )
-                              && $output->{$field} eq $value;
-                        }
-                        elsif ( $comparison eq 'not_equals' ) {
-                            $delete = 1
-                              if defined( $output->{$field} )
-                              && $output->{$field} ne $value;
-                        }
-
-                        say "DELETING $output->{cardnumber} BECAUSE "
-                          . Data::Dumper::Dumper($c)
-                          if $delete && $verbose;
-
-                        if ($delete) {
-                            delete_if_found( $output, $job );
-                        }
-                        else {
-                            push( @output_data, $output );
-                        }
-                    }
-
-                    delete_if_found( $output, $job ) if $delete;
-                }
-                else {
-                    push( @output_data, $output );
-                }
-            }
-
-            my ( $tmp_fh, $tmp_filename ) = tempfile();
-            binmode( $tmp_fh, ":utf8" );
-            my $csv = Text::CSV::Slurp->create( input => \@output_data );
-            print $tmp_fh $csv;
-            close $tmp_fh;
-
-            # Reopen file handle for reading
-            my $handle;
-            open( $handle, "<:encoding(UTF-8)", $tmp_filename ) or die $!;
-
-            my $params = $job->{parameters};
-            my $return = $Import->import_patrons(
-                {
-                    file => $handle,
-                    %$params,
-                }
-            );
-
-            my $feedback    = $return->{feedback};
-            my $errors      = $return->{errors};
-            my $imported    = $return->{imported};
-            my $overwritten = $return->{overwritten};
-            my $alreadyindb = $return->{already_in_db};
-            my $invalid     = $return->{invalid};
-            my $total = $imported + $alreadyindb + $invalid + $overwritten;
-
-            if ($verbose) {
-                say q{};
-                say "Import complete:";
-                say "Imported:    $imported";
-                say "Overwritten: $overwritten";
-                say "Skipped:     $alreadyindb";
-                say "Invalid:     $invalid";
-                say "Total:       $total";
-                say q{};
-            }
-
-            $self->_record_job_run(
-                $job->{name}, $content_hash,
-                { imported => $imported, overwritten => $overwritten, already_in_db => $alreadyindb, invalid => $invalid }
-            );
-
-            if ( my $email_conf = $job->{email_results} ) {
-
-                $email_conf->{text_body} = qq{
-Import complete for $job->{name}:
-Imported:    $imported
-Overwritten: $overwritten
-Skipped:     $alreadyindb
-Invalid:     $invalid
-Total:       $total
-                };
-
-                my $email = Koha::Email->create($email_conf);
-
-                try {
-                    $email->send_or_die();
-                }
-                catch {
-                    warn "ERROR: Failed to send email for job $job->{name}: $_";
-                }
-            }
-
-            if ( $verbose > 1 ) {
-                say "Errors:";
-                say Data::Dumper::Dumper($errors);
-            }
-
-            if ( $verbose > 2 ) {
-                say "Feedback:";
-                say Data::Dumper::Dumper($feedback);
-            }
-
-            if ( $job->{post_import_transformer} ) {
-                my $sub_name = $job->{post_import_transformer};
-                my $sub      = $transformers->{$sub_name};
-                die "NO TRANSFORMER NAMED $sub_name DEFINED"
-                  unless $sub;
-
-                try {
-                    &$sub( \@output_data, $job );
-                }
-                catch {
-                    warn "Call to transformer $sub_name failed with errors: $_";
-                };
+            else {
+                $self->_run_record_job( $job, $transformers );
             }
 
         }
@@ -637,6 +391,809 @@ Total:       $total
             C4::Context->dbh->selectrow_array( q{SELECT RELEASE_LOCK(?)}, undef, $lock_name )
               if $lock_acquired;
         };
+    }
+}
+
+=head3 _run_record_job
+
+Run a single C<type: record> (CSV patron import) job: download its source
+file via the configured transport, apply column mapping/transformation,
+skip re-importing unchanged content, hand the result to
+C<Koha::Patrons::Import>, and record/report the outcome.
+
+=cut
+
+sub _run_record_job {
+    my ( $self, $job, $transformers ) = @_;
+
+    my $debug   = $job->{debug}   || 0;
+    my $verbose = $job->{verbose} || 0;
+
+    my $transport_id = $job->{file_transport_id};
+    unless ($transport_id) {
+        say "JOB $job->{name} HAS NO file_transport_id, SKIPPING";
+        return;
+    }
+
+    my $transport = Koha::File::Transports->find($transport_id);
+    unless ($transport) {
+        say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING";
+        return;
+    }
+
+    my $filename       = process_tt( $job->{filename} );
+    my $directory      = tempdir( CLEANUP => 1 );
+    my $local_path     = "$directory/$filename";
+    my $download_opts = $job->{path} ? { path => process_tt( $job->{path} ) } : {};
+
+    $debug && say "Downloading '$filename' via transport #$transport_id to '$local_path'";
+
+    # Some Koha versions' SFTP transport dies rather than returning
+    # false on failure (e.g. Koha 25.11, missing JSON import) -
+    # catch that too, not just a false return, so either failure
+    # mode produces the same informative error below.
+    my $downloaded = try { $transport->download_file( $filename, $local_path, $download_opts ) } catch { 0 };
+    $downloaded
+      or die "Patrons Importer - TRANSPORT ERROR: download failed for $filename: "
+      . join( '; ', map { $_->message } @{ $transport->object_messages } );
+
+    my $filepath = $local_path;
+
+    # Write a header if needed
+    if ( my $header = $job->{file}->{header} ) {
+        my ( $new_tmp_fh, $new_tmp_filename ) = tempfile();
+        binmode( $new_tmp_fh, ":utf8" );
+
+        open my $new, '>:encoding(UTF-8)', $new_tmp_filename
+          or die "$new_tmp_filename: $!";
+        open my $old, '<:encoding(UTF-8)', $filepath
+          or die "$filepath: $!";
+
+        print {$new} "$header\n";
+        print {$new} $_ while <$old>;
+        close $new;
+
+        $filepath = $new_tmp_filename;
+    }
+
+    my $content_hash = $self->_content_hash($filepath);
+    unless ( $self->_job_should_run( $job->{name}, $content_hash ) ) {
+        say "No changes since last run for job $job->{name}, skipping" if $debug || $verbose;
+        return;
+    }
+
+    my $options = $job->{csv_options} || {};
+    my $inputs = Text::CSV::Slurp->load( file => $filepath, %$options );
+
+    my @output_data;
+    foreach my $input (@$inputs) {
+        $debug && say "WORKING ON " . Data::Dumper::Dumper($input);
+
+        if ( $input->{disabled} ) {
+            say "DISABLED, SKIPPING...";
+            next;
+        }
+
+        my $skip = 0;
+        foreach my $input_column ( keys %{ $job->{skip_incoming} } ) {
+            my $values = $job->{skip_incoming}->{$input_column};
+            foreach my $value (@$values) {
+                if ( defined $input->{$input_column}
+                    && $input->{$input_column} eq $value )
+                {
+                    $debug
+                      && say
+"SKIPPING: Row has column '$input_column' value of $value, skipping!";
+                    $skip = 1;
+                    last;
+                }
+            }
+        }
+        next if $skip;
+
+        my $output = {};
+        my $stash  = {};
+
+        my $columns = $job->{columns};
+        foreach my $column (@$columns) {
+            my $output_column = $column->{output};
+            say "NO OUPUT SPECIFIED FOR "
+              . Data::Dumper::Dumper($column)
+              unless $output;
+
+            if ( defined $column->{static} ) {
+                my $static_value = $column->{static};
+                $output->{$output_column} = $static_value;
+            }
+            elsif ( defined $column->{input} ) {
+                my $input_column = $column->{input};
+                my $value        = $input->{$input_column} // q{};
+                my $prefix       = $column->{prefix}       // q{};
+                my $padding      = $column->{padding}      // q{};
+                my $length       = $column->{length}       // 0;
+
+                my $padding_length =
+                  $length - length($prefix) - length($value);
+                $padding_length = 0 if $padding_length < 0;
+                $padding        = $padding x $padding_length;
+
+                $value = $prefix . $padding . $value;
+                $output->{$output_column} = $value;
+            }
+            elsif ( defined $column->{mapping} ) {
+                my $mapping = $column->{mapping};
+                my $source  = $mapping->{source};
+                my $map     = $mapping->{map};
+
+                my $input_value = $input->{$source};
+                my $value       = $map->{$input_value};
+                $output->{$output_column} = $value;
+            }
+            elsif ( defined $column->{transformer} ) {
+                my $sub_name = $column->{transformer};
+                my $sub      = $transformers->{$sub_name};
+                die "NO TRANSFORMER NAMED $sub_name DEFINED"
+                  unless $sub;
+
+                try {
+                    &$sub( $input, $output, $stash, $job );
+                }
+                catch {
+                    warn
+"Call to transformer $sub_name failed with errors: $_";
+                };
+            }
+        }
+
+        $debug && say "OUTPUT: " . Data::Dumper::Dumper($output);
+
+        if ( $job->{delete_incoming} ) {
+            my $criteria = $job->{delete_incoming};
+
+            my $delete = 0;
+
+            foreach my $c (@$criteria) {
+                my $field      = $c->{field};
+                my $value      = $c->{value};
+                my $comparison = $c->{comparison};
+
+                next
+                  unless defined($field)
+                  && defined($value)
+                  && defined($comparison);
+
+                if ( $comparison eq 'equals' ) {
+                    $delete = 1
+                      if defined( $output->{$field} )
+                      && $output->{$field} eq $value;
+                }
+                elsif ( $comparison eq 'not_equals' ) {
+                    $delete = 1
+                      if defined( $output->{$field} )
+                      && $output->{$field} ne $value;
+                }
+
+                say "DELETING $output->{cardnumber} BECAUSE "
+                  . Data::Dumper::Dumper($c)
+                  if $delete && $verbose;
+
+                if ($delete) {
+                    delete_if_found( $output, $job );
+                }
+                else {
+                    push( @output_data, $output );
+                }
+            }
+
+            delete_if_found( $output, $job ) if $delete;
+        }
+        else {
+            push( @output_data, $output );
+        }
+    }
+
+    my ( $tmp_fh, $tmp_filename ) = tempfile();
+    binmode( $tmp_fh, ":utf8" );
+    my $csv = Text::CSV::Slurp->create( input => \@output_data );
+    print $tmp_fh $csv;
+    close $tmp_fh;
+
+    # Reopen file handle for reading
+    my $handle;
+    open( $handle, "<:encoding(UTF-8)", $tmp_filename ) or die $!;
+
+    my $Import = Koha::Patrons::Import->new();
+    my $params = $job->{parameters};
+    my $return = $Import->import_patrons(
+        {
+            file => $handle,
+            %$params,
+        }
+    );
+
+    my $feedback    = $return->{feedback};
+    my $errors      = $return->{errors};
+    my $imported    = $return->{imported};
+    my $overwritten = $return->{overwritten};
+    my $alreadyindb = $return->{already_in_db};
+    my $invalid     = $return->{invalid};
+    my $total = $imported + $alreadyindb + $invalid + $overwritten;
+
+    if ($verbose) {
+        say q{};
+        say "Import complete:";
+        say "Imported:    $imported";
+        say "Overwritten: $overwritten";
+        say "Skipped:     $alreadyindb";
+        say "Invalid:     $invalid";
+        say "Total:       $total";
+        say q{};
+    }
+
+    $self->_record_job_run(
+        $job->{name}, $content_hash,
+        { imported => $imported, overwritten => $overwritten, already_in_db => $alreadyindb, invalid => $invalid }
+    );
+
+    if ( my $email_conf = $job->{email_results} ) {
+
+        $email_conf->{text_body} = qq{
+Import complete for $job->{name}:
+Imported:    $imported
+Overwritten: $overwritten
+Skipped:     $alreadyindb
+Invalid:     $invalid
+Total:       $total
+        };
+
+        my $email = Koha::Email->create($email_conf);
+
+        try {
+            $email->send_or_die();
+        }
+        catch {
+            warn "ERROR: Failed to send email for job $job->{name}: $_";
+        }
+    }
+
+    if ( $verbose > 1 ) {
+        say "Errors:";
+        say Data::Dumper::Dumper($errors);
+    }
+
+    if ( $verbose > 2 ) {
+        say "Feedback:";
+        say Data::Dumper::Dumper($feedback);
+    }
+
+    if ( $job->{post_import_transformer} ) {
+        my $sub_name = $job->{post_import_transformer};
+        my $sub      = $transformers->{$sub_name};
+        die "NO TRANSFORMER NAMED $sub_name DEFINED"
+          unless $sub;
+
+        try {
+            &$sub( \@output_data, $job );
+        }
+        catch {
+            warn "Call to transformer $sub_name failed with errors: $_";
+        };
+    }
+}
+
+=head3 _resolve_photo_patron
+
+Resolve a patron from a matchpoint field name ("cardnumber", "userid", or
+"patron_attribute_<code>") and an identifier value. Mirrors Koha core Bug
+43637's C<Koha::Patron::Image::Import::_resolve_patron> (independent
+implementation, same algorithm - see the Phase 2 spec's "Forward
+compatibility" section). Returns a C<Koha::Patron> or undef if nothing
+matches.
+
+=cut
+
+sub _resolve_photo_patron {
+    my ( $self, $matchpoint, $identifier ) = @_;
+
+    return unless defined $identifier && length $identifier;
+
+    return Koha::Patrons->find( { $matchpoint => $identifier } )
+      if $matchpoint eq 'cardnumber' || $matchpoint eq 'userid';
+
+    my ($code) = $matchpoint =~ /^patron_attribute_(.+)$/;
+    return unless $code;
+
+    my $attribute_type = Koha::Patron::Attribute::Types->find($code);
+    return unless $attribute_type && $attribute_type->unique_id;
+
+    my @borrowernumbers =
+      Koha::Patron::Attributes->search( { code => $code, attribute => $identifier } )->get_column('borrowernumber');
+    return unless @borrowernumbers == 1;
+
+    return Koha::Patrons->find( $borrowernumbers[0] );
+}
+
+=head3 _import_photo
+
+Validate, resize if needed, convert to PNG, and store an open filehandle
+(positioned at the start) as the patron image for whichever patron
+C<matchpoint>/C<identifier> resolves to. C<matchpoint> is one of
+"cardnumber", "userid", or "patron_attribute_<code>". If C<dry_run> is
+true, resolves and validates the image but does not store it.
+
+Returns C<{ success => 1 }> on success, or C<{ error => $code }> on
+failure: C<OVRSIZ> (over 2MB), C<CORERR> (GD could not read the image),
+C<PATRON_NOT_FOUND>, or C<DBERR> (storing the image failed).
+
+=cut
+
+sub _import_photo {
+    my ( $self, $args ) = @_;
+    my ( $fh, $identifier, $matchpoint, $dry_run ) = @{$args}{qw( file identifier matchpoint dry_run )};
+
+    my $size = -s $fh;
+    return { error => 'OVRSIZ' } if $size > PHOTO_MAX_FILE_SIZE;
+
+    my $srcimage = eval { GD::Image->new($fh) };
+    return { error => 'CORERR' } unless defined $srcimage;
+
+    my $patron = $self->_resolve_photo_patron( $matchpoint, $identifier );
+    return { error => 'PATRON_NOT_FOUND' } unless $patron;
+
+    my $imgfile = $self->_photo_to_png($srcimage);
+
+    if ($dry_run) {
+        say "DRY RUN: would store image for $matchpoint => $identifier (borrowernumber "
+          . $patron->borrowernumber . ")";
+        return { success => 1 };
+    }
+
+    my $image = $patron->image;
+    $image ||= Koha::Patron::Image->new( { borrowernumber => $patron->borrowernumber } );
+    $image->set( { mimetype => 'image/png', imagefile => $imgfile } );
+
+    my $stored = eval { $image->store };
+    return { error => 'DBERR' } if $@ || !$stored;
+
+    return { success => 1 };
+}
+
+=head3 _photo_to_png
+
+Convert a GD::Image to PNG bytes, resizing it first if either dimension
+exceeds 200x300, preserving aspect ratio by scaling to whichever of the
+two ratios (width or height) is smaller, so the result always fits within
+the bounding box.
+
+=cut
+
+sub _photo_to_png {
+    my ( $self, $srcimage ) = @_;
+
+    my ( $width, $height ) = $srcimage->getBounds();
+    return $srcimage->png() unless $width > PHOTO_MAX_WIDTH || $height > PHOTO_MAX_HEIGHT;
+
+    my $width_ratio  = PHOTO_MAX_WIDTH / $width;
+    my $height_ratio = PHOTO_MAX_HEIGHT / $height;
+    my $scale        = $width_ratio < $height_ratio ? $width_ratio : $height_ratio;
+
+    my $new_width  = sprintf( '%.0f', $width * $scale );
+    my $new_height = sprintf( '%.0f', $height * $scale );
+
+    my $resized = GD::Image->new( $new_width, $new_height, 1 );
+    $resized->copyResampled( $srcimage, 0, 0, 0, 0, $new_width, $new_height, $width, $height );
+
+    return $resized->png();
+}
+
+=head3 _is_safe_relative_path
+
+Structural zip-slip guard: true if C<$path> is a relative path with no
+".." component, no null byte, and is not an absolute path (unix "/..." or
+windows "C:\..."). Independent implementation of the same check used by
+C<Koha::ArticleRequest::ScanImport> and Koha core Bug 43637's
+C<Koha::Patron::Image::Import> - see the Phase 2 spec's "Forward
+compatibility" section.
+
+=cut
+
+sub _is_safe_relative_path {
+    my ( $self, $path ) = @_;
+
+    return 0 unless defined $path && length $path;
+    return 0 if $path =~ /\0/;
+    return 0 if $path =~ m{\A/};
+    return 0 if $path =~ m{\A[A-Za-z]:[\\/]};
+
+    for my $part ( split m{[\\/]+}, $path ) {
+        next unless length $part;
+        return 0 if $part eq '..';
+    }
+
+    return 1;
+}
+
+=head3 _check_photo_path_safe_and_exists
+
+Validates that C<$filename> (as resolved relative to C<$extract_dir>)
+cannot escape C<$extract_dir> - structurally via C<_is_safe_relative_path>,
+then again via C<realpath> once the file is known to exist, to also catch
+symlink-based escapes. Returns undef if safe, or an error code
+(C<UNSAFE_PATH> or C<FILE_NOT_FOUND>) otherwise.
+
+=cut
+
+sub _check_photo_path_safe_and_exists {
+    my ( $self, $extract_dir, $filename ) = @_;
+
+    return 'UNSAFE_PATH' unless $self->_is_safe_relative_path($filename);
+
+    my $candidate = File::Spec->catfile( $extract_dir, $filename );
+    return 'FILE_NOT_FOUND' unless -f $candidate;
+
+    my $real_dir  = realpath($extract_dir);
+    my $real_file = realpath($candidate);
+    return 'UNSAFE_PATH'
+      unless defined $real_file
+      && defined $real_dir
+      && ( $real_file eq $real_dir || index( $real_file, "$real_dir/" ) == 0 );
+
+    return;
+}
+
+=head3 _find_photo_image_files
+
+Recursively collects every file under C<$dir> whose name matches
+C<PHOTO_IMAGE_EXTENSION_RE>, returning each one's path relative to
+C<$base>.
+
+=cut
+
+sub _find_photo_image_files {
+    my ( $self, $dir, $base ) = @_;
+
+    opendir( my $dh, $dir ) or return;
+    my @entries = grep { !/^\.\.?$/ } readdir $dh;
+    closedir $dh;
+
+    my @found;
+    for my $entry ( sort @entries ) {
+        my $path = File::Spec->catfile( $dir, $entry );
+        if ( -d $path ) {
+            push @found, $self->_find_photo_image_files( $path, $base );
+        }
+        elsif ( $entry =~ PHOTO_IMAGE_EXTENSION_RE ) {
+            push @found, File::Spec->abs2rel( $path, $base );
+        }
+    }
+    return @found;
+}
+
+=head3 _find_photo_mapping_file
+
+Recursively searches C<$dir> for a file named C<idlink.txt> or
+C<datalink.txt> (case-insensitive), returning its full path, or undef if
+none is found.
+
+=cut
+
+sub _find_photo_mapping_file {
+    my ( $self, $dir ) = @_;
+
+    opendir( my $dh, $dir ) or return;
+    my @entries = readdir $dh;
+    closedir $dh;
+
+    for my $entry (@entries) {
+        next if $entry =~ /^\.\.?$/;
+        my $path = File::Spec->catfile( $dir, $entry );
+        return $path if -f $path && $entry =~ /^(?:idlink|datalink)\.txt$/i;
+        if ( -d $path ) {
+            my $found = $self->_find_photo_mapping_file($path);
+            return $found if $found;
+        }
+    }
+    return;
+}
+
+=head3 _photo_rows_from_mapping_file
+
+Parses C<$mapping_file> (tab- or comma-delimited "identifier,filename"
+lines, delimiter sniffed per line) into a list of C<{ identifier,
+filename }> hashrefs, or C<{ error => 'BAD_ROW' }> for a line that could
+not be parsed.
+
+=cut
+
+sub _photo_rows_from_mapping_file {
+    my ( $self, $mapping_file ) = @_;
+
+    open my $fh, '<', $mapping_file or die "Unable to read $mapping_file: $!\n";
+    my @lines = <$fh>;
+    close $fh;
+
+    my @rows;
+    for my $line (@lines) {
+        chomp $line;
+        next unless length $line;
+
+        my $delim = ( $line =~ /\t/ ) ? "\t" : ( $line =~ /,/ ) ? ',' : undef;
+        unless ($delim) {
+            push @rows, { error => 'BAD_ROW' };
+            next;
+        }
+
+        my ( $identifier, $filename ) = split $delim, $line, 2;
+        $identifier =~ s/[\"\r\n]//g if defined $identifier;
+        $filename   =~ s/[\"\r\n]//g if defined $filename;
+
+        unless ( defined $identifier && length $identifier && defined $filename && length $filename ) {
+            push @rows, { error => 'BAD_ROW' };
+            next;
+        }
+
+        push @rows, { identifier => $identifier, filename => $filename };
+    }
+    return @rows;
+}
+
+=head3 _photo_rows_from_filenames
+
+Recursively finds every image file under C<$extract_dir> and returns a
+C<{ identifier, filename }> hashref per file, where C<identifier> is the
+file's own basename with its extension removed. Used when no mapping file
+is present in the archive.
+
+=cut
+
+sub _photo_rows_from_filenames {
+    my ( $self, $extract_dir ) = @_;
+
+    my @rows;
+    for my $relative ( $self->_find_photo_image_files( $extract_dir, $extract_dir ) ) {
+        my ($basename) = $relative =~ m{([^/\\]+)$};
+        ( my $stem = $basename ) =~ s/\.[^.]+$//;
+        push @rows, { identifier => $stem, filename => $relative };
+    }
+    return @rows;
+}
+
+=head3 _import_photo_batch
+
+Extracts the zip at C<$args-E<gt>{file}> (a local file path) and imports
+every image it finds via C<_import_photo>: if the archive contains an
+C<idlink.txt>/C<datalink.txt> mapping file, each row is resolved via that
+mapping; otherwise every image file found is matched by its own filename's
+stem against C<matchpoint> directly. Each row is processed in isolation -
+one failure never aborts the rest of the batch. Rejects (without
+extracting) an archive with more than C<PHOTO_MAX_ZIP_MEMBERS>
+non-directory members. Symbolic-link members are skipped during
+extraction - never followed, never created - since a symlink whose target
+is an out-of-tree path, combined with a later member name that resolves
+through it, would otherwise let a crafted zip write outside
+C<$extract_dir> regardless of the per-name path checks. Returns
+C<{ imported => [...], errors => [...] }>. Dies with a plain string only
+if the zip itself cannot be read.
+
+=cut
+
+sub _import_photo_batch {
+    my ( $self, $args ) = @_;
+    my ( $zip_path, $matchpoint, $dry_run ) = @{$args}{qw( file matchpoint dry_run )};
+
+    my $zip = Archive::Zip->new;
+    die "Unable to read zip file: $zip_path\n"
+      unless $zip->read($zip_path) == Archive::Zip::AZ_OK;
+
+    my @non_dir_members = grep { !$_->isDirectory } $zip->members;
+    if ( @non_dir_members > PHOTO_MAX_ZIP_MEMBERS ) {
+        return { imported => [], errors => [ { error => 'TOO_MANY_MEMBERS' } ] };
+    }
+
+    my $extract_dir = tempdir( CLEANUP => 1 );
+    for my $member ( $zip->members ) {
+        next if $member->isDirectory;
+        next if $member->isSymbolicLink;
+        my $name = $member->fileName;
+        next unless $self->_is_safe_relative_path($name);
+        $member->extractToFileNamed( File::Spec->catfile( $extract_dir, $name ) ) == Archive::Zip::AZ_OK
+          or die "Unable to extract $name from $zip_path\n";
+    }
+
+    my $result       = { imported => [], errors => [] };
+    my $mapping_file = $self->_find_photo_mapping_file($extract_dir);
+    my @rows =
+      $mapping_file
+      ? $self->_photo_rows_from_mapping_file($mapping_file)
+      : $self->_photo_rows_from_filenames($extract_dir);
+
+    for my $row (@rows) {
+        my ( $identifier, $filename ) = @{$row}{qw( identifier filename )};
+
+        if ( $row->{error} ) {
+            push @{ $result->{errors} }, { identifier => $identifier, filename => $filename, error => $row->{error} };
+            next;
+        }
+
+        my $path_error = $self->_check_photo_path_safe_and_exists( $extract_dir, $filename );
+        if ($path_error) {
+            push @{ $result->{errors} }, { identifier => $identifier, filename => $filename, error => $path_error };
+            next;
+        }
+
+        my $real_file = realpath( File::Spec->catfile( $extract_dir, $filename ) );
+        my $outcome   = eval {
+            open my $fh, '<', $real_file or die "Unable to read $real_file: $!\n";
+            my $r = $self->_import_photo(
+                { file => $fh, identifier => $identifier, matchpoint => $matchpoint, dry_run => $dry_run } );
+            close $fh;
+            $r;
+        };
+        if ($@) {
+            push @{ $result->{errors} }, { identifier => $identifier, filename => $filename, error => 'UNEXPECTED_ERROR' };
+            next;
+        }
+        if ( $outcome->{error} ) {
+            push @{ $result->{errors} }, { identifier => $identifier, filename => $filename, error => $outcome->{error} };
+        }
+        else {
+            push @{ $result->{imported} }, { identifier => $identifier, filename => $filename };
+        }
+    }
+
+    return $result;
+}
+
+=head3 _run_photo_job
+
+Run a single C<type: photo> job: list the configured directory on the
+job's file transport, and for every zip archive or loose image file
+found (rejecting any listed filename containing a path separator, since
+the listing comes from the transport and cannot be trusted), skip it via
+per-(job, filename) content-hash dedup if unchanged since last import,
+otherwise download and import it (a zip via C<_import_photo_batch>, a
+loose file via C<_import_photo> keyed off its own filename stem), and
+log a per-job run summary. Dedup history is only recorded for a file
+that both actually ran for real (not C<dry_run>) and produced at least
+one successful import - a dry run, or a file that fully failed, is left
+eligible for retry on the next run rather than being permanently
+skipped based on unchanged bytes.
+
+=cut
+
+sub _run_photo_job {
+    my ( $self, $job ) = @_;
+
+    my $debug   = $job->{debug}   || 0;
+    my $verbose = $job->{verbose} || 0;
+
+    my $transport_id = $job->{file_transport_id};
+    unless ($transport_id) {
+        say "JOB $job->{name} HAS NO file_transport_id, SKIPPING";
+        return;
+    }
+
+    my $transport = Koha::File::Transports->find($transport_id);
+    unless ($transport) {
+        say "JOB $job->{name} REFERENCES UNKNOWN file_transport_id $transport_id, SKIPPING";
+        return;
+    }
+
+    my $matchpoint = $job->{matchpoint};
+    unless ($matchpoint) {
+        say "JOB $job->{name} HAS NO matchpoint CONFIGURED, SKIPPING";
+        return;
+    }
+
+    my $list_opts = $job->{path} ? { path => process_tt( $job->{path} ) } : {};
+    my $files = try { $transport->list_files($list_opts) } catch { undef };
+    unless ($files) {
+        say "JOB $job->{name} UNABLE TO LIST FILES: "
+          . join( '; ', map { $_->message } @{ $transport->object_messages } );
+        return;
+    }
+
+    my $dry_run = $job->{parameters}->{dry_run};
+    my $summary = { imported => 0, skipped => 0, errors => {} };
+
+    foreach my $file (@$files) {
+        my $filename = $file->{filename};
+        next unless defined $filename;
+        next unless $filename =~ /\.zip$/i || $filename =~ PHOTO_IMAGE_EXTENSION_RE;
+
+        # The listing comes from the remote transport, which may be
+        # compromised or malicious - never trust a path separator in a
+        # listed filename, or it could be used to escape the download
+        # tempdir (e.g. "../../../etc/cron.d/evil.png"), the same threat
+        # _import_photo_batch's zip-slip guard defends against one layer
+        # down, from the same untrusted source.
+        if ( $filename =~ m{[/\\]} ) {
+            say "JOB $job->{name} REJECTING UNSAFE FILENAME '$filename' FROM TRANSPORT LISTING";
+            next;
+        }
+
+        my $directory  = tempdir( CLEANUP => 1 );
+        my $local_path = "$directory/$filename";
+
+        $debug && say "Downloading '$filename' via transport #$transport_id to '$local_path'";
+
+        my $downloaded = try { $transport->download_file( $filename, $local_path, $list_opts ) } catch { 0 };
+        unless ($downloaded) {
+            say "JOB $job->{name} FAILED TO DOWNLOAD $filename: "
+              . join( '; ', map { $_->message } @{ $transport->object_messages } );
+            next;
+        }
+
+        my $content_hash = $self->_content_hash($local_path);
+        unless ( $self->_job_should_run( $job->{name}, $content_hash, $filename ) ) {
+            say "No changes since last run for $job->{name}:$filename, skipping" if $debug || $verbose;
+            $summary->{skipped}++;
+            next;
+        }
+
+        my $result;
+        if ( $filename =~ /\.zip$/i ) {
+            $result = eval {
+                $self->_import_photo_batch( { file => $local_path, matchpoint => $matchpoint, dry_run => $dry_run } );
+            };
+            if ($@) {
+                say "JOB $job->{name} FAILED TO PROCESS ZIP $filename: $@";
+                next;
+            }
+        }
+        else {
+            my ($identifier) = $filename =~ /^(.+)\.[^.]+$/;
+            my $outcome = eval {
+                open my $fh, '<', $local_path or die "Unable to read $local_path: $!\n";
+                my $r = $self->_import_photo(
+                    { file => $fh, identifier => $identifier, matchpoint => $matchpoint, dry_run => $dry_run } );
+                close $fh;
+                $r;
+            };
+            if ($@) {
+                say "JOB $job->{name} FAILED TO PROCESS $filename: $@";
+                next;
+            }
+            $result =
+              $outcome->{error}
+              ? { imported => [], errors => [ { identifier => $identifier, filename => $filename, error => $outcome->{error} } ] }
+              : { imported => [ { identifier => $identifier, filename => $filename } ], errors => [] };
+        }
+
+        $summary->{imported} += scalar @{ $result->{imported} };
+        foreach my $error ( @{ $result->{errors} } ) {
+            $summary->{errors}->{ $error->{error} }++;
+            say "  error: $error->{error} (identifier="
+              . ( $error->{identifier} // '' ) . ", filename=" . ( $error->{filename} // '' ) . ")"
+              if $verbose;
+        }
+
+        my $imported_count = scalar @{ $result->{imported} };
+        my $error_count    = scalar @{ $result->{errors} };
+
+        # Don't record history for a dry run (there's nothing real to skip
+        # next time), and don't record it for a file that fully failed
+        # (zero imports, at least one error) - a file that never actually
+        # imported anything should be retried next run, not permanently
+        # dedup-skipped until its bytes happen to change. A partial
+        # success (at least one import, even alongside some errors) still
+        # records normally.
+        unless ( $dry_run || ( $imported_count == 0 && $error_count > 0 ) ) {
+            $self->_record_job_run(
+                $job->{name}, $content_hash,
+                { imported => $imported_count, errors => $error_count },
+                $filename
+            );
+        }
+    }
+
+    if ($verbose) {
+        say q{};
+        say "Photo import complete for $job->{name}:";
+        say "Imported: $summary->{imported}";
+        say "Skipped:  $summary->{skipped}";
+        say "Errors:   " . join( ', ', map { "$_=$summary->{errors}->{$_}" } sort keys %{ $summary->{errors} } );
+        say q{};
     }
 }
 
@@ -782,33 +1339,40 @@ sub _import_log {
 
 =head3 _job_should_run
 
-Given a job name and the content hash of its freshly downloaded input file,
-return true if this content is new since the job's last recorded run (i.e.
-the import should proceed), false if it's identical to last time (skip).
+Given a job name and the content hash of its freshly downloaded input
+file, return true if this content is new since the job's last recorded
+run (i.e. the import should proceed), false if it's identical to last
+time (skip). An optional C<$filename> keys the history on the
+(job, filename) pair instead of the job name alone - used by photo jobs,
+which process many files per run and need independent history per file;
+record jobs (one file per job) omit it and keep the job-name-only key.
 
 =cut
 
 sub _job_should_run {
-    my ( $self, $job_name, $content_hash ) = @_;
+    my ( $self, $job_name, $content_hash, $filename ) = @_;
 
+    my $key  = defined $filename ? "$job_name:$filename" : $job_name;
     my $log  = $self->_import_log;
-    my $last = $log->{$job_name} or return 1;
+    my $last = $log->{$key} or return 1;
 
     return ( $last->{last_hash} // '' ) ne $content_hash ? 1 : 0;
 }
 
 =head3 _record_job_run
 
-Record that a job ran with the given content hash and result summary, for
-future C<_job_should_run> comparisons.
+Record that a job (optionally, one specific file within it - see
+C<_job_should_run>) ran with the given content hash and result summary,
+for future C<_job_should_run> comparisons.
 
 =cut
 
 sub _record_job_run {
-    my ( $self, $job_name, $content_hash, $summary ) = @_;
+    my ( $self, $job_name, $content_hash, $summary, $filename ) = @_;
 
+    my $key = defined $filename ? "$job_name:$filename" : $job_name;
     my $log = $self->_import_log;
-    $log->{$job_name} = {
+    $log->{$key} = {
         last_hash   => $content_hash,
         last_run_at => strftime( '%Y-%m-%dT%H:%M:%S', localtime ),
         %$summary,
